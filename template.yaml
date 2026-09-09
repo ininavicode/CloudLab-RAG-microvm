@@ -35,6 +35,10 @@ Resources:
                   - logs:CreateLogStream
                   - logs:PutLogEvents
                 Resource: "*"
+              - Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                Resource: "*"
 
   ExecutionRole:
     Type: AWS::IAM::Role
@@ -46,7 +50,9 @@ Resources:
           - Effect: Allow
             Principal:
               Service: lambda.amazonaws.com
-            Action: sts:AssumeRole
+            Action:
+              - sts:AssumeRole
+              - sts:TagSession
       Policies:
         - PolicyName: BedrockInvokeAndLogs
           PolicyDocument:
