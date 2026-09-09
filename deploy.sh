@@ -54,6 +54,7 @@ if [ -z "$IMAGE_ARN" ]; then
         --code-artifact "uri=s3://$CODE_BUCKET/app.zip" \
         --base-image-arn "$BASE_IMAGE_ARN" \
         --build-role-arn "$BUILD_ROLE_ARN" \
+        --resources "[{\"minimumMemoryInMiB\": $BASELINE_MEMORY_MIB}]" \
         --hooks '{"port":8080,"microvmImageHooks":{"ready":"ENABLED","readyTimeoutInSeconds":60}}' \
         --region $REGION)
     IMAGE_ARN=$(echo "$CREATE_OUTPUT" | jq -r '.imageArn')
@@ -75,7 +76,7 @@ while true; do
         --query "state" \
         --output text)
     echo "  Current build state: $BUILD_STATE"
-    if [ "$BUILD_STATE" = "CREATED" ]; then
+    if [ "$BUILD_STATE" = "CREATED" ] || [ "$BUILD_STATE" = "UPDATED" ]; then
         echo "Image is ready."
         break
     elif [ "$BUILD_STATE" = "CREATE_FAILED" ] || [ "$BUILD_STATE" = "UPDATE_FAILED" ]; then
