@@ -68,7 +68,7 @@ else
         --region $REGION
 fi
 
-echo "Waiting for MicroVM image to reach CREATED state (ARN: $IMAGE_ARN)..."
+echo "Waiting for MicroVM image to reach CREATED or UPDATED state (ARN: $IMAGE_ARN)..."
 while true; do
     BUILD_STATE=$(aws lambda-microvms get-microvm-image \
         --image-identifier "$IMAGE_ARN" \
