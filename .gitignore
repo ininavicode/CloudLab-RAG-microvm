@@ -1,3 +1,7 @@
 # agent-related
 .agents/
 GEMINI.md
+
+# file extensions
+*.zip
+*.env

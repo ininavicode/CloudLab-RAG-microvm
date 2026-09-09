@@ -17,7 +17,9 @@ Resources:
           - Effect: Allow
             Principal:
               Service: lambda.amazonaws.com
-            Action: sts:AssumeRole
+            Action:
+              - sts:AssumeRole
+              - sts:TagSession
       Policies:
         - PolicyName: CodeBucketReadAndLogs
           PolicyDocument:

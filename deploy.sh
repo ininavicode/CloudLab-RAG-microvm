@@ -3,10 +3,13 @@ set -e
 
 STACK_NAME="jmejias-rag-microvm-stack"
 REGION="us-east-1"
-IMAGE_NAME="jmejias-rag-microvm-image"
+IMAGE_NAME="microvm-rag-image"
 
-echo "Fetching managed base image..."
-BASE_IMAGE=$(aws lambda-microvms list-managed-microvm-images --query "items[0].imageArn" --output text)
+echo "Fetching managed base image ARN..."
+BASE_IMAGE_ARN=$(aws lambda-microvms list-managed-microvm-images \
+    --query "items[0].imageArn" \
+    --output text \
+    --region $REGION)
 
 echo "Deploying CloudFormation stack..."
 aws cloudformation deploy \
@@ -16,78 +19,117 @@ aws cloudformation deploy \
     --region $REGION
 
 echo "Fetching outputs from CloudFormation..."
-CODE_BUCKET=$(aws cloudformation describe-stacks --stack-name $STACK_NAME --region $REGION --query 'Stacks[0].Outputs[?OutputKey==`CodeBucketName`].OutputValue' --output text)
-BUILD_ROLE_ARN=$(aws cloudformation describe-stacks --stack-name $STACK_NAME --region $REGION --query 'Stacks[0].Outputs[?OutputKey==`BuildRoleArn`].OutputValue' --output text)
-EXECUTION_ROLE_ARN=$(aws cloudformation describe-stacks --stack-name $STACK_NAME --region $REGION --query 'Stacks[0].Outputs[?OutputKey==`ExecutionRoleArn`].OutputValue' --output text)
+CODE_BUCKET=$(aws cloudformation describe-stacks \
+    --stack-name $STACK_NAME --region $REGION \
+    --query 'Stacks[0].Outputs[?OutputKey==`CodeBucketName`].OutputValue' \
+    --output text)
+BUILD_ROLE_ARN=$(aws cloudformation describe-stacks \
+    --stack-name $STACK_NAME --region $REGION \
+    --query 'Stacks[0].Outputs[?OutputKey==`BuildRoleArn`].OutputValue' \
+    --output text)
+EXECUTION_ROLE_ARN=$(aws cloudformation describe-stacks \
+    --stack-name $STACK_NAME --region $REGION \
+    --query 'Stacks[0].Outputs[?OutputKey==`ExecutionRoleArn`].OutputValue' \
+    --output text)
 
 echo "Packaging application..."
-zip -r app.zip app.py requirements.txt
+# -j stores files flat (no directory prefix) so Dockerfile is at the top level of the zip
+zip -j app.zip Dockerfile app.py requirements.txt
 
 echo "Uploading artifact to S3 ($CODE_BUCKET)..."
 aws s3 cp app.zip s3://$CODE_BUCKET/app.zip
 
-# Check if the MicroVM image already exists by listing and filtering by name
+# Determine whether the image already exists using its ARN from list output,
+# since get-microvm-image only accepts ARNs but we don't have one yet at first run.
 echo "Checking if MicroVM image '$IMAGE_NAME' already exists..."
-EXISTING_IMAGE_ARN=$(aws lambda-microvms list-microvm-images \
+IMAGE_ARN=$(aws lambda-microvms list-microvm-images \
     --region $REGION \
-    --output json | jq -r ".items[]? | select(.name == \"$IMAGE_NAME\" or .imageName == \"$IMAGE_NAME\") | .imageArn")
+    --query "items[?name=='$IMAGE_NAME'].imageArn" \
+    --output text)
 
-if [ -n "$EXISTING_IMAGE_ARN" ]; then
-    echo "Image exists (ARN: $EXISTING_IMAGE_ARN). Updating MicroVM image '$IMAGE_NAME'..."
-    aws lambda-microvms update-microvm-image \
-        --image-identifier "$EXISTING_IMAGE_ARN" \
-        --base-image-arn $BASE_IMAGE \
-        --code-artifact uri=s3://$CODE_BUCKET/app.zip \
-        --build-role-arn $BUILD_ROLE_ARN \
-        --region $REGION
-    IMAGE_ARN="$EXISTING_IMAGE_ARN"
-else
-    echo "Image not found. Creating MicroVM image '$IMAGE_NAME'..."
-    aws lambda-microvms create-microvm-image \
+if [ -z "$IMAGE_ARN" ]; then
+    echo "Image not found. Creating new image..."
+    CREATE_OUTPUT=$(aws lambda-microvms create-microvm-image \
         --name "$IMAGE_NAME" \
-        --base-image-arn $BASE_IMAGE \
-        --code-artifact uri=s3://$CODE_BUCKET/app.zip \
-        --build-role-arn $BUILD_ROLE_ARN \
+        --code-artifact "uri=s3://$CODE_BUCKET/app.zip" \
+        --base-image-arn "$BASE_IMAGE_ARN" \
+        --build-role-arn "$BUILD_ROLE_ARN" \
+        --hooks '{"port":8080,"microvmImageHooks":{"ready":"ENABLED","readyTimeoutInSeconds":60}}' \
+        --region $REGION)
+    IMAGE_ARN=$(echo "$CREATE_OUTPUT" | jq -r '.imageArn')
+else
+    echo "Image exists (ARN: $IMAGE_ARN). Updating..."
+    aws lambda-microvms update-microvm-image \
+        --image-identifier "$IMAGE_ARN" \
+        --code-artifact "uri=s3://$CODE_BUCKET/app.zip" \
+        --base-image-arn "$BASE_IMAGE_ARN" \
+        --build-role-arn "$BUILD_ROLE_ARN" \
         --region $REGION
-        
-    echo "Fetching ARN of newly created MicroVM image..."
-    IMAGE_ARN=$(aws lambda-microvms list-microvm-images \
-        --region $REGION \
-        --query "items[?name=='$IMAGE_NAME'].imageArn" \
-        --output text)
 fi
 
-# Wait until the image build state reaches CREATED
 echo "Waiting for MicroVM image to reach CREATED state (ARN: $IMAGE_ARN)..."
 while true; do
     BUILD_STATE=$(aws lambda-microvms get-microvm-image \
         --image-identifier "$IMAGE_ARN" \
         --region $REGION \
-        --query 'buildState' \
+        --query "state" \
         --output text)
     echo "  Current build state: $BUILD_STATE"
     if [ "$BUILD_STATE" = "CREATED" ]; then
         echo "Image is ready."
         break
-    elif [ "$BUILD_STATE" = "FAILED" ]; then
-        echo "Error: MicroVM image build FAILED. Aborting."
+    elif [ "$BUILD_STATE" = "CREATE_FAILED" ] || [ "$BUILD_STATE" = "UPDATE_FAILED" ]; then
+        FAILED_VER=$(aws lambda-microvms get-microvm-image \
+            --image-identifier "$IMAGE_ARN" \
+            --region $REGION \
+            --query "latestFailedImageVersion" \
+            --output text)
+        REASON=$(aws lambda-microvms get-microvm-image-version \
+            --image-identifier "$IMAGE_ARN" \
+            --image-version "$FAILED_VER" \
+            --region $REGION \
+            --query "stateReason" \
+            --output text)
+        echo "Error: MicroVM image build FAILED. Reason: $REASON"
         exit 1
     fi
     sleep 15
 done
 
 echo "Running MicroVM..."
-# Based on instructions: aws lambda-microvms run-microvm using Execution Role, attaching ALL_INGRESS and INTERNET_EGRESS
 RUN_OUTPUT=$(aws lambda-microvms run-microvm \
     --image-identifier "$IMAGE_ARN" \
-    --role-arn $EXECUTION_ROLE_ARN \
-    --network-connectors ALL_INGRESS INTERNET_EGRESS \
+    --execution-role-arn "$EXECUTION_ROLE_ARN" \
+    --ingress-network-connectors "arn:aws:lambda:$REGION:aws:network-connector:aws-network-connector:ALL_INGRESS" \
+    --egress-network-connectors "arn:aws:lambda:$REGION:aws:network-connector:aws-network-connector:INTERNET_EGRESS" \
+    --idle-policy '{"autoResumeEnabled":true,"maxIdleDurationSeconds":900,"suspendedDurationSeconds":300}' \
     --region $REGION)
 
+MICROVM_ID=$(echo "$RUN_OUTPUT" | jq -r '.microvmId')
 ENDPOINT=$(echo "$RUN_OUTPUT" | jq -r '.endpoint')
+
+echo "Waiting for MicroVM to reach RUNNING state..."
+while true; do
+    MVM_STATE=$(aws lambda-microvms get-microvm \
+        --microvm-identifier "$MICROVM_ID" \
+        --region $REGION \
+        --query "state" \
+        --output text)
+    echo "  Current MicroVM state: $MVM_STATE"
+    if [ "$MVM_STATE" = "RUNNING" ]; then
+        echo "MicroVM is running."
+        break
+    elif [ "$MVM_STATE" = "FAILED" ]; then
+        echo "Error: MicroVM FAILED."
+        exit 1
+    fi
+    sleep 10
+done
+
 if [[ "$ENDPOINT" != http* ]]; then
     ENDPOINT="https://$ENDPOINT"
 fi
 echo "MICROVM_URL=$ENDPOINT" > .env
+echo "MICROVM_ID=$MICROVM_ID" >> .env
 
-echo "Deployment complete! Endpoint saved to .env"
+echo "Deployment complete! Endpoint and ID saved to .env"
