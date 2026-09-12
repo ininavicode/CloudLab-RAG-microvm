@@ -1,0 +1,9 @@
+[
+  "How does systemd resolve service dependencies during the boot process?",     
+  "What is the difference between an Ansible playbook and a role?",             
+  "How does the Kubernetes control plane manage worker node state?",            
+  "How do PromQL queries aggregate time-series metrics?",                       
+  "How do SELinux contexts enforce mandatory access control on file operations?",
+  "What are the advantages of ZFS copy-on-write over traditional file systems?",
+  "How does BGP handle route propagation and avoid routing loops?"             
+]
