@@ -1,5 +1,6 @@
 import os
 import json
+import time
 import boto3
 import lancedb
 from contextlib import asynccontextmanager
@@ -16,6 +17,12 @@ BEDROCK_MODEL_ID = "amazon.titan-embed-text-v1"
 # Globals initialized at startup, not at import time
 bedrock_client = None
 db = None
+
+
+def _ns_to_ms(ns: int) -> float:
+    """Convert nanoseconds to milliseconds with microsecond precision."""
+    return round(ns / 1_000_000, 3)
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -61,11 +68,15 @@ async def run_hook():
 
 @app.post("/ingest")
 async def ingest_document(file: UploadFile = File(...)):
+    t_start = time.perf_counter_ns()
+
     if not file.filename.endswith(".pdf"):
         raise HTTPException(status_code=400, detail="Only PDF files are supported")
 
     try:
+        t_read = time.perf_counter_ns()
         content = await file.read()
+        file_read_ns = time.perf_counter_ns() - t_read
         pdf = PdfReader(io.BytesIO(content))
 
         text_chunks = []
@@ -80,12 +91,20 @@ async def ingest_document(file: UploadFile = File(...)):
                 })
 
         if not text_chunks:
-            return {"message": "No text extracted from PDF"}
+            elapsed = _ns_to_ms(time.perf_counter_ns() - t_start)
+            return {
+                "message": "No text extracted from PDF",
+                "timings": {"server_total_ms": elapsed, "bedrock_ms": 0, "lancedb_ms": 0, "file_read_ms": _ns_to_ms(file_read_ns)}
+            }
 
         # Generate embeddings and prepare records
+        bedrock_ns = 0
         data_to_insert = []
         for chunk in text_chunks:
+            t_bed = time.perf_counter_ns()
             embedding = get_embedding(chunk["text"])
+            bedrock_ns += time.perf_counter_ns() - t_bed
+
             data_to_insert.append({
                 "vector": embedding,
                 "text": chunk["text"],
@@ -94,33 +113,58 @@ async def ingest_document(file: UploadFile = File(...)):
             })
 
         # Insert into LanceDB (create table on first run, append thereafter)
+        t_lance = time.perf_counter_ns()
         if TABLE_NAME not in db.table_names():
             db.create_table(TABLE_NAME, data=data_to_insert)
         else:
             table = db.open_table(TABLE_NAME)
             table.add(data_to_insert)
+        lancedb_ns = time.perf_counter_ns() - t_lance
 
-        return {"message": f"Successfully ingested {len(text_chunks)} chunks from {file.filename}"}
+        server_total_ns = time.perf_counter_ns() - t_start
+        return {
+            "message": f"Successfully ingested {len(text_chunks)} chunks from {file.filename}",
+            "timings": {
+                "server_total_ms": _ns_to_ms(server_total_ns),
+                "bedrock_ms": _ns_to_ms(bedrock_ns),
+                "lancedb_ms": _ns_to_ms(lancedb_ns),
+                "file_read_ms": _ns_to_ms(file_read_ns),
+            }
+        }
     except Exception as e:
         print(f"[ingest] Error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/query")
 async def query_documents(request: QueryRequest):
+    t_start = time.perf_counter_ns()
+
     if TABLE_NAME not in db.table_names():
         raise HTTPException(status_code=404, detail="No documents ingested yet")
 
     try:
+        t_bed = time.perf_counter_ns()
         question_embedding = get_embedding(request.question)
+        bedrock_ns = time.perf_counter_ns() - t_bed
 
+        t_lance = time.perf_counter_ns()
         table = db.open_table(TABLE_NAME)
         results = table.search(question_embedding).limit(5).to_list()
+        lancedb_ns = time.perf_counter_ns() - t_lance
 
         # Strip the vector field to keep the response payload small
         for res in results:
             res.pop("vector", None)
 
-        return {"results": results}
+        server_total_ns = time.perf_counter_ns() - t_start
+        return {
+            "results": results,
+            "timings": {
+                "server_total_ms": _ns_to_ms(server_total_ns),
+                "bedrock_ms": _ns_to_ms(bedrock_ns),
+                "lancedb_ms": _ns_to_ms(lancedb_ns),
+            }
+        }
     except Exception as e:
         print(f"[query] Error: {e}")
         raise HTTPException(status_code=500, detail=str(e))

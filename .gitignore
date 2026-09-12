@@ -6,3 +6,6 @@ GEMINI.md
 *.zip
 *.env
 *.pdf
+
+# directories
+benchmarking/results/
