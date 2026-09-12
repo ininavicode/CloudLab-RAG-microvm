@@ -135,7 +135,10 @@ def do_ingest_request(endpoint, token, pdf_path):
         end_ns = time.perf_counter_ns()
         
         probe_ms = round((end_ns - start_ns) / 1_000_000, 3)
-        timings = response.json().get('timings', {})
+        json_resp = response.json()
+        if 'timings' not in json_resp:
+            raise ValueError(f"Missing 'timings' in response: {json_resp}")
+        timings = json_resp['timings']
         
         return {
             'probe_e2e_ms': probe_ms,
@@ -148,13 +151,24 @@ def do_ingest_request(endpoint, token, pdf_path):
     except Exception as e:
         end_ns = time.perf_counter_ns()
         probe_ms = round((end_ns - start_ns) / 1_000_000, 3)
+        err_msg = str(e)
+        if hasattr(e, 'response') and e.response is not None:
+            try:
+                err_body = e.response.json()
+                if isinstance(err_body, dict):
+                    detail = err_body.get('detail') or err_body.get('message')
+                    if detail:
+                        err_msg = f"{e.response.status_code} Error: {detail}"
+            except Exception:
+                err_msg = f"{e.response.status_code} Error: {e.response.text[:200]}"
+                
         return {
             'probe_e2e_ms': probe_ms,
             'server_total_ms': 0.0,
             'bedrock_ms': 0.0,
             'lancedb_ms': 0.0,
             'file_read_ms': 0.0,
-            'error': str(e)
+            'error': err_msg
         }
 
 def do_query_request(endpoint, token, question):
@@ -176,7 +190,10 @@ def do_query_request(endpoint, token, question):
         end_ns = time.perf_counter_ns()
         
         probe_ms = round((end_ns - start_ns) / 1_000_000, 3)
-        timings = response.json().get('timings', {})
+        json_resp = response.json()
+        if 'timings' not in json_resp:
+            raise ValueError(f"Missing 'timings' in response: {json_resp}")
+        timings = json_resp['timings']
         
         return {
             'probe_e2e_ms': probe_ms,
@@ -189,13 +206,24 @@ def do_query_request(endpoint, token, question):
     except Exception as e:
         end_ns = time.perf_counter_ns()
         probe_ms = round((end_ns - start_ns) / 1_000_000, 3)
+        err_msg = str(e)
+        if hasattr(e, 'response') and e.response is not None:
+            try:
+                err_body = e.response.json()
+                if isinstance(err_body, dict):
+                    detail = err_body.get('detail') or err_body.get('message')
+                    if detail:
+                        err_msg = f"{e.response.status_code} Error: {detail}"
+            except Exception:
+                err_msg = f"{e.response.status_code} Error: {e.response.text[:200]}"
+                
         return {
             'probe_e2e_ms': probe_ms,
             'server_total_ms': 0.0,
             'bedrock_ms': 0.0,
             'lancedb_ms': 0.0,
             'file_read_ms': 0.0,
-            'error': str(e)
+            'error': err_msg
         }
 
 def build_result_row(benchmark_type, item_name, metrics):
