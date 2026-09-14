@@ -12,3 +12,4 @@ GEMINI.md
 benchmarking/results/
 benchmarking/analysis/results/
 **/.venv/
+**/__pycache__/

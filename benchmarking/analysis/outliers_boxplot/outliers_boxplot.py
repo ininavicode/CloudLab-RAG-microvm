@@ -1,4 +1,5 @@
 import os
+import glob
 import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
@@ -6,85 +7,98 @@ from matplotlib.backends.backend_pdf import PdfPages
 
 def main():
     # File paths
-    input_file = '../merge/merged.csv'
+    input_dir = '../merge'
     output_dir = '.'
     
-    # Read data
-    print(f"Reading {input_file}...")
-    df = pd.read_csv(input_file)
-    
-    # Columns of interest for the Y axis
-    metrics = ['probe_e2e_ms', 'server_total_ms', 'resume_overhead_ms', 
-               'bedrock_ms', 'lancedb_ms', 'file_read_ms']
-    
-    # Filter only available metrics
-    available_metrics = [m for m in metrics if m in df.columns]
-    
-    if not available_metrics:
-        print("No valid metric columns found to plot.")
+    csv_files = glob.glob(os.path.join(input_dir, '*.csv'))
+    if not csv_files:
+        print(f"No CSV files found in {input_dir}")
         return
         
-    print(f"Metrics to plot: {available_metrics}")
-
     # Set up seaborn style
     sns.set_theme(style="whitegrid")
     
-    # If environment column is not present for some reason, mock it so code doesn't fail
-    if 'environment' not in df.columns:
-        print("Warning: 'environment' column not found, defaulting to 'unknown'.")
-        df['environment'] = 'unknown'
+    # Columns we should NEVER plot
+    ignore_cols = {
+        'id', 'benchmark_type', 'item_name_or_query', 'query', 'doc_name',
+        'error', 'response', 'cw_request_id', 'topic', 'status_code',
+        'invocation_idx', 'mode', 's3_key', 'metric_handler_total_objectKey'
+    }
+    
+    for file in csv_files:
+        basename = os.path.basename(file)
+        name_no_ext = os.path.splitext(basename)[0]
+        output_pdf = os.path.join(output_dir, f"outliers_boxplot_{name_no_ext}.pdf")
         
-    # Loop through each environment and create a separate PDF
-    for env in df['environment'].unique():
-        output_pdf = os.path.join(output_dir, f'outliers_boxplot_{env}.pdf')
-        df_env = df[df['environment'] == env]
-        print(f"\nProcessing environment: {env} -> saving to {output_pdf}")
+        print(f"Processing {file}...")
+        df = pd.read_csv(file)
         
-        # Create the PDF for this environment
-        with PdfPages(output_pdf) as pdf:
+        if 'id' not in df.columns:
+            print(f"  Skipping {file} due to missing 'id' column.")
+            continue
             
-            # Loop through each benchmark_type (treated as separate datasets)
-            for btype in df_env['benchmark_type'].unique():
-                df_btype = df_env[df_env['benchmark_type'] == btype]
+        # Determine numeric columns for Y axis
+        numeric_cols = df.select_dtypes(include=['number']).columns
+        available_metrics = [c for c in numeric_cols if c not in ignore_cols and not c.endswith('_ms_ms') and 'epoch' not in c.lower() and 'time' not in c.lower()]
+        
+        # Also clean up any that might have been accidentally included
+        # specifically some lambda cw_ columns
+        available_metrics = [c for c in available_metrics if not c.startswith('cw_memory') and not c.startswith('cw_max_memory') and not c == 'metric_retrieval_total_numDocs']
+        
+        if not available_metrics:
+            print(f"  No valid metric columns found to plot in {file}.")
+            continue
+            
+        print(f"  Metrics to plot: {available_metrics}")
+        
+        # Try to find the item name column to use in title
+        item_col = None
+        for col in ['item_name_or_query', 'query', 'doc_name']:
+            if col in df.columns:
+                item_col = col
+                break
                 
-                # Loop through each id
-                for item_id in sorted(df_btype['id'].unique()):
-                    df_id = df_btype[df_btype['id'] == item_id]
+        with PdfPages(output_pdf) as pdf:
+            # Loop through each id
+            for item_id in sorted(df['id'].unique()):
+                df_id = df[df['id'] == item_id]
+                
+                # Transform data from wide to long format so seaborn can plot multiple columns easily
+                df_melted = df_id.melt(
+                    id_vars=['id'],
+                    value_vars=available_metrics,
+                    var_name='metric',
+                    value_name='latency_ms'
+                )
+                
+                # Create the plot
+                plt.figure(figsize=(12, 6))
+                
+                # Boxplot automatically calculates percentiles and outliers
+                sns.boxplot(
+                    data=df_melted, 
+                    x='metric', 
+                    y='latency_ms',
+                    palette="Set2"
+                )
+                
+                # Beautify the plot
+                item_name = df_id[item_col].iloc[0] if item_col else "Unknown"
+                # Truncate title if too long
+                if len(str(item_name)) > 80:
+                    item_name = str(item_name)[:77] + "..."
                     
-                    # Transform data from wide to long format so seaborn can plot multiple columns easily
-                    df_melted = df_id.melt(
-                        id_vars=['id', 'benchmark_type', 'environment'],
-                        value_vars=available_metrics,
-                        var_name='metric',
-                        value_name='latency_ms'
-                    )
-                    
-                    # Create the plot
-                    plt.figure(figsize=(10, 6))
-                    
-                    # Boxplot automatically calculates percentiles and outliers
-                    sns.boxplot(
-                        data=df_melted, 
-                        x='metric', 
-                        y='latency_ms',
-                        palette="Set2"
-                    )
-                    
-                    # Beautify the plot
-                    item_name = df_id['item_name_or_query'].iloc[0]
-                    plt.title(f"Latency Distribution by Component\nEnvironment: {env} | Type: {btype}\nID: {item_id} ({item_name})", fontsize=14)
-                    plt.xlabel("Component / Operation", fontsize=12)
-                    plt.ylabel("Latency (ms)", fontsize=12)
-                    plt.xticks(rotation=45, ha='right')
-                    plt.tight_layout()
-                    
-                    # Save the current figure to the PDF
-                    pdf.savefig()
-                    plt.close()
-                    
-                    print(f"  Generated chart for ID: {item_id}, Type: {btype}")
-                    
-        print(f"Saved {output_pdf}")
+                plt.title(f"Latency Distribution by Component\nDataset: {name_no_ext} | ID: {item_id}\n({item_name})", fontsize=12)
+                plt.xlabel("Component / Operation", fontsize=10)
+                plt.ylabel("Latency (ms)", fontsize=10)
+                plt.xticks(rotation=45, ha='right', fontsize=8)
+                plt.tight_layout()
+                
+                # Save the current figure to the PDF
+                pdf.savefig()
+                plt.close()
+                
+        print(f"  Saved {output_pdf}")
 
 if __name__ == '__main__':
     main()
