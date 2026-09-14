@@ -144,8 +144,16 @@ def do_ingest_request(endpoint, token, pdf_path):
             'probe_e2e_ms': probe_ms,
             'server_total_ms': timings.get('server_total_ms', 0.0),
             'bedrock_ms': timings.get('bedrock_ms', 0.0),
-            'lancedb_ms': timings.get('lancedb_ms', 0.0),
             'file_read_ms': timings.get('file_read_ms', 0.0),
+            'pdf_read_ms': timings.get('pdf_read_ms', 0.0),
+            'chunking_ms': timings.get('chunking_ms', 0.0),
+            'lance_table_open_ms': timings.get('lance_table_open_ms', 0.0),
+            'lance_insert_rows_ms': timings.get('lance_insert_rows_ms', 0.0),
+            # query-only fields — not present for ingest
+            'lancedb_open_ms': 0.0,
+            'lancedb_search_ms': 0.0,
+            'vector_strip_ms': 0.0,
+            'context_length_chars': 0,
             'error': ''
         }
     except Exception as e:
@@ -161,13 +169,20 @@ def do_ingest_request(endpoint, token, pdf_path):
                         err_msg = f"{e.response.status_code} Error: {detail}"
             except Exception:
                 err_msg = f"{e.response.status_code} Error: {e.response.text[:200]}"
-                
+
         return {
             'probe_e2e_ms': probe_ms,
             'server_total_ms': 0.0,
             'bedrock_ms': 0.0,
-            'lancedb_ms': 0.0,
             'file_read_ms': 0.0,
+            'pdf_read_ms': 0.0,
+            'chunking_ms': 0.0,
+            'lance_table_open_ms': 0.0,
+            'lance_insert_rows_ms': 0.0,
+            'lancedb_open_ms': 0.0,
+            'lancedb_search_ms': 0.0,
+            'vector_strip_ms': 0.0,
+            'context_length_chars': 0,
             'error': err_msg
         }
 
@@ -199,8 +214,16 @@ def do_query_request(endpoint, token, question):
             'probe_e2e_ms': probe_ms,
             'server_total_ms': timings.get('server_total_ms', 0.0),
             'bedrock_ms': timings.get('bedrock_ms', 0.0),
-            'lancedb_ms': timings.get('lancedb_ms', 0.0),
-            'file_read_ms': timings.get('file_read_ms', 0.0),
+            'lancedb_open_ms': timings.get('lancedb_open_ms', 0.0),
+            'lancedb_search_ms': timings.get('lancedb_search_ms', 0.0),
+            'vector_strip_ms': timings.get('vector_strip_ms', 0.0),
+            'context_length_chars': json_resp.get('context_length_chars', 0),
+            # ingest-only fields — not present for query
+            'file_read_ms': 0.0,
+            'pdf_read_ms': 0.0,
+            'chunking_ms': 0.0,
+            'lance_table_open_ms': 0.0,
+            'lance_insert_rows_ms': 0.0,
             'error': ''
         }
     except Exception as e:
@@ -216,13 +239,20 @@ def do_query_request(endpoint, token, question):
                         err_msg = f"{e.response.status_code} Error: {detail}"
             except Exception:
                 err_msg = f"{e.response.status_code} Error: {e.response.text[:200]}"
-                
+
         return {
             'probe_e2e_ms': probe_ms,
             'server_total_ms': 0.0,
             'bedrock_ms': 0.0,
-            'lancedb_ms': 0.0,
+            'lancedb_open_ms': 0.0,
+            'lancedb_search_ms': 0.0,
+            'vector_strip_ms': 0.0,
             'file_read_ms': 0.0,
+            'pdf_read_ms': 0.0,
+            'chunking_ms': 0.0,
+            'lance_table_open_ms': 0.0,
+            'lance_insert_rows_ms': 0.0,
+            'context_length_chars': 0,
             'error': err_msg
         }
 
@@ -244,8 +274,17 @@ def build_result_row(benchmark_type, item_name, metrics):
         'server_total_ms': server_ms,
         'resume_overhead_ms': resume_overhead,
         'bedrock_ms': metrics.get('bedrock_ms', 0.0),
-        'lancedb_ms': metrics.get('lancedb_ms', 0.0),
+        # ingest-specific
         'file_read_ms': metrics.get('file_read_ms', 0.0),
+        'pdf_read_ms': metrics.get('pdf_read_ms', 0.0),
+        'chunking_ms': metrics.get('chunking_ms', 0.0),
+        'lance_table_open_ms': metrics.get('lance_table_open_ms', 0.0),
+        'lance_insert_rows_ms': metrics.get('lance_insert_rows_ms', 0.0),
+        # query-specific
+        'lancedb_open_ms': metrics.get('lancedb_open_ms', 0.0),
+        'lancedb_search_ms': metrics.get('lancedb_search_ms', 0.0),
+        'vector_strip_ms': metrics.get('vector_strip_ms', 0.0),
+        'context_length_chars': metrics.get('context_length_chars', 0),
         'error': metrics.get('error', '')
     }
 
@@ -355,7 +394,13 @@ def write_report(results, output_path):
     fieldnames = [
         'benchmark_type', 'item_name_or_query', 'probe_e2e_ms',
         'server_total_ms', 'resume_overhead_ms', 'bedrock_ms',
-        'lancedb_ms', 'file_read_ms', 'error'
+        # ingest-specific
+        'file_read_ms', 'pdf_read_ms', 'chunking_ms',
+        'lance_table_open_ms', 'lance_insert_rows_ms',
+        # query-specific
+        'lancedb_open_ms', 'lancedb_search_ms', 'vector_strip_ms',
+        # shared
+        'context_length_chars', 'error'
     ]
     
     try:

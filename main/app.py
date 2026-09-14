@@ -77,8 +77,12 @@ async def ingest_document(file: UploadFile = File(...)):
         t_read = time.perf_counter_ns()
         content = await file.read()
         file_read_ns = time.perf_counter_ns() - t_read
-        pdf = PdfReader(io.BytesIO(content))
 
+        t_pdf_read = time.perf_counter_ns()
+        pdf = PdfReader(io.BytesIO(content))
+        pdf_read_ns = time.perf_counter_ns() - t_pdf_read
+
+        t_chunking = time.perf_counter_ns()
         text_chunks = []
         # Chunk by page — each page becomes one document
         for i, page in enumerate(pdf.pages):
@@ -89,6 +93,7 @@ async def ingest_document(file: UploadFile = File(...)):
                     "page": i + 1,
                     "filename": file.filename
                 })
+        chunking_ns = time.perf_counter_ns() - t_chunking
 
         if not text_chunks:
             elapsed = _ns_to_ms(time.perf_counter_ns() - t_start)
@@ -113,13 +118,22 @@ async def ingest_document(file: UploadFile = File(...)):
             })
 
         # Insert into LanceDB (create table on first run, append thereafter)
-        t_lance = time.perf_counter_ns()
+        t_lance_table_open = 0
+        t_lance_insert_rows = 0
+        lance_table_open_ns = 0
+        lance_insert_rows_ns = 0
         if TABLE_NAME not in db.table_names():
+            t_lance_table_open = time.perf_counter_ns()
             db.create_table(TABLE_NAME, data=data_to_insert)
+            lance_table_open_ns = time.perf_counter_ns() - t_lance_table_open
         else:
+            t_lance_table_open = time.perf_counter_ns()
             table = db.open_table(TABLE_NAME)
+            lance_table_open_ns = time.perf_counter_ns() - t_lance_table_open
+
+            t_lance_insert_rows = time.perf_counter_ns()
             table.add(data_to_insert)
-        lancedb_ns = time.perf_counter_ns() - t_lance
+            lance_insert_rows_ns = time.perf_counter_ns() - t_lance_insert_rows
 
         server_total_ns = time.perf_counter_ns() - t_start
         return {
@@ -127,8 +141,11 @@ async def ingest_document(file: UploadFile = File(...)):
             "timings": {
                 "server_total_ms": _ns_to_ms(server_total_ns),
                 "bedrock_ms": _ns_to_ms(bedrock_ns),
-                "lancedb_ms": _ns_to_ms(lancedb_ns),
                 "file_read_ms": _ns_to_ms(file_read_ns),
+                "pdf_read_ms": _ns_to_ms(pdf_read_ns),
+                "chunking_ms": _ns_to_ms(chunking_ns),
+                "lance_table_open_ms": _ns_to_ms(lance_table_open_ns),
+                "lance_insert_rows_ms": _ns_to_ms(lance_insert_rows_ns),
             }
         }
     except Exception as e:
@@ -147,22 +164,33 @@ async def query_documents(request: QueryRequest):
         question_embedding = get_embedding(request.question)
         bedrock_ns = time.perf_counter_ns() - t_bed
 
-        t_lance = time.perf_counter_ns()
+        t_lance_open = time.perf_counter_ns()
         table = db.open_table(TABLE_NAME)
-        results = table.search(question_embedding).limit(5).to_list()
-        lancedb_ns = time.perf_counter_ns() - t_lance
+        lancedb_open_ns = time.perf_counter_ns() - t_lance_open
 
+        t_lance_search = time.perf_counter_ns()
+        results = table.search(question_embedding).limit(5).to_list()
+        lancedb_search_ns = time.perf_counter_ns() - t_lance_search
+
+        t_vector_strip = time.perf_counter_ns()
         # Strip the vector field to keep the response payload small
+        # And compute context length
+        retrieved_context_length = 0
         for res in results:
             res.pop("vector", None)
+            retrieved_context_length += len(res.get("text", ""))
+        vector_strip_ns = time.perf_counter_ns() - t_vector_strip
 
         server_total_ns = time.perf_counter_ns() - t_start
         return {
             "results": results,
+            "context_length_chars": retrieved_context_length,
             "timings": {
                 "server_total_ms": _ns_to_ms(server_total_ns),
                 "bedrock_ms": _ns_to_ms(bedrock_ns),
-                "lancedb_ms": _ns_to_ms(lancedb_ns),
+                "lancedb_open_ms": _ns_to_ms(lancedb_open_ns),
+                "lancedb_search_ms": _ns_to_ms(lancedb_search_ns),
+                "vector_strip_ms": _ns_to_ms(vector_strip_ns),
             }
         }
     except Exception as e:
