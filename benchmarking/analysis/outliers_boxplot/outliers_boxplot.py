@@ -7,8 +7,9 @@ from matplotlib.backends.backend_pdf import PdfPages
 
 def main():
     # File paths
-    input_dir = '../merge'
-    output_dir = '.'
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    input_dir = os.path.abspath(os.path.join(script_dir, '..', 'merge'))
+    output_dir = script_dir
     
     csv_files = glob.glob(os.path.join(input_dir, '*.csv'))
     if not csv_files:

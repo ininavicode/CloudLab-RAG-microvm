@@ -127,8 +127,9 @@ def compare_environments(test_type, lambda_csv, microvm_csv, output_pdf):
     print(f"Saved {output_pdf}")
 
 def main():
-    base_dir = '../merge'
-    output_dir = '.'
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    base_dir = os.path.abspath(os.path.join(script_dir, '..', 'merge'))
+    output_dir = script_dir
     
     # 1. Ingest Comparison
     compare_environments(
