@@ -79,13 +79,7 @@ def aggregate_differences(test_type, lambda_csv, microvm_csv, output_pdf):
         
         bars = ax.bar(df_summary['Metric'], df_summary['Avg_Difference'], color=colors, edgecolor='black', alpha=0.85)
         
-        # Determine if we need symlog scale (based on max absolute difference)
-        max_abs_diff = df_summary['Avg_Difference'].abs().max()
-        if max_abs_diff > 100:
-            ax.set_yscale('symlog', linthresh=10.0)
-            plt.ylabel("Average Difference (ms) [symlog scale]", fontsize=12)
-        else:
-            plt.ylabel("Average Difference (ms)", fontsize=12)
+        plt.ylabel("Average Difference (ms)", fontsize=12)
             
         # Draw a horizontal line at 0
         plt.axhline(0, color='black', linewidth=1.5, linestyle='--')
