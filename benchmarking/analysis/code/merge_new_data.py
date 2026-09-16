@@ -7,9 +7,31 @@ def fix_decimals(text):
     # Fix comma decimals like "773,03" -> 773.03
     return re.sub(r'"(\d+),(\d+)"', r'\1.\2', text)
 
+LAMBDA_INGEST_MAP = {
+    'cw_init_duration_ms': 'resume_overhead_ms',
+    'doc_name': 'item_name_or_query',
+    'metric_handler_total_dbOpenDuration': 'lance_table_open_ms',
+    'metric_handler_total_dbRowsCreationDuration': 'lance_insert_rows_ms',
+    'metric_handler_total_embeddingDurationMs': 'bedrock_ms',
+    'metric_handler_total_loadAndSplitDocDurationMs': 'chunking_ms',
+    'metric_handler_total_ms': 'server_total_ms',
+    'metric_handler_total_s3LoadDurationMs': 'file_read_ms'
+}
+
+LAMBDA_QUERY_MAP = {
+    'cw_init_duration_ms': 'resume_overhead_ms',
+    'elapsed_client_ms': 'probe_e2e_ms',
+    'metric_bedrock_query_ms_ms': 'bedrock_ms',
+    'metric_handler_total_ms': 'server_total_ms',
+    'metric_lancedb_open_ms': 'lancedb_open_ms',
+    'metric_retrieval_total_ms': 'lancedb_search_ms',
+    'query': 'item_name_or_query'
+}
+
 def merge_new_data():
-    base_results = '../../results'
-    merge_dir = '../merge'
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    base_results = os.path.abspath(os.path.join(script_dir, '..', '..', 'results'))
+    merge_dir = os.path.abspath(os.path.join(script_dir, '..', 'merge'))
     
     envs = ['lambda', 'microvm']
     
@@ -84,6 +106,12 @@ def merge_new_data():
                 print(f"Could not determine if {file} is query or ingest.")
                 continue
                 
+            # Map header if env is lambda
+            mapped_header = list(header)
+            if env == 'lambda':
+                mapping = LAMBDA_QUERY_MAP if is_query else LAMBDA_INGEST_MAP
+                mapped_header = [mapping.get(c, c) for c in header]
+                
             for row in reader:
                 if not row or len(row) != len(header):
                     continue
@@ -94,7 +122,7 @@ def merge_new_data():
                     current_id += 1
                 
                 out_row = [item_to_id[item_val]] + row
-                out_header = ['id'] + header
+                out_header = ['id'] + mapped_header
                 
                 if is_query:
                     if query_header is None:

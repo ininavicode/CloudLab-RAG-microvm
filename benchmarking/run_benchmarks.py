@@ -88,7 +88,8 @@ def suspend_and_wait(region, microvm_id):
         response = json.loads(result.stdout)
         state = response.get('state')
         if state == 'SUSPENDED':
-            print_progress("MicroVM is now SUSPENDED.")
+            print_progress("MicroVM is now SUSPENDED. Waiting 5s before firing request...")
+            time.sleep(5)
             return
         print_progress(f"Current state: {state}. Waiting...")
         time.sleep(poll_interval_s)
@@ -405,7 +406,8 @@ def write_report(results, output_path):
     
     try:
         with open(output_path, 'w', newline='') as f:
-            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            # restval=0 means any missing numeric field writes 0 instead of ''
+            writer = csv.DictWriter(f, fieldnames=fieldnames, restval=0, extrasaction='ignore')
             writer.writeheader()
             writer.writerows(results)
         print_progress(f"Saved CSV report to {output_path}")

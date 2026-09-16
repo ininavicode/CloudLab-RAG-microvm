@@ -3,11 +3,13 @@ import json
 import time
 import boto3
 import lancedb
+import io
+import concurrent.futures
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from pydantic import BaseModel
 from pypdf import PdfReader
-import io
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 # Configuration
 LANCEDB_PATH = "/tmp/lancedb_data"
@@ -18,11 +20,9 @@ BEDROCK_MODEL_ID = "amazon.titan-embed-text-v1"
 bedrock_client = None
 db = None
 
-
 def _ns_to_ms(ns: int) -> float:
     """Convert nanoseconds to milliseconds with microsecond precision."""
     return round(ns / 1_000_000, 3)
-
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -63,7 +63,21 @@ async def ready_hook():
 
 @app.post("/aws/lambda-microvms/runtime/v1/run")
 async def run_hook():
-    """Hook called after snapshot restore, before routing external traffic."""
+    """Hook called after snapshot restore, before routing external traffic.
+
+    IMPORTANT: boto3 and lancedb hold TCP connection pools that become stale
+    after the MicroVM is suspended (the OS freezes all sockets). If we reuse
+    those connections on resume, boto3 silently retries the same request (same
+    x-amzn-requestid) after hitting a dead socket, causing 15-20s outliers.
+    Reinitialising the clients here gives every resume a fresh connection pool
+    before any user traffic is routed.
+    """
+    global bedrock_client, db
+    bedrock_client = boto3.client(
+        "bedrock-runtime",
+        region_name=os.environ.get("AWS_REGION", "us-east-1")
+    )
+    db = lancedb.connect(LANCEDB_PATH)
     return {"status": "running"}
 
 @app.post("/ingest")
@@ -80,18 +94,32 @@ async def ingest_document(file: UploadFile = File(...)):
 
         t_pdf_read = time.perf_counter_ns()
         pdf = PdfReader(io.BytesIO(content))
+        
+        # 1. Replicating `splitPages: false` by concatenating all pages into a single string
+        full_text = ""
+        for page in pdf.pages:
+            extracted = page.extract_text()
+            if extracted:
+                full_text += extracted + "\n"
         pdf_read_ns = time.perf_counter_ns() - t_pdf_read
 
         t_chunking = time.perf_counter_ns()
+        # 2. Replicating the Lambda RecursiveCharacterTextSplitter
+        text_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=1000,
+            chunk_overlap=200, 
+            length_function=len,
+        )
+        
+        split_texts = text_splitter.split_text(full_text)
+        
         text_chunks = []
-        # Chunk by page — each page becomes one document
-        for i, page in enumerate(pdf.pages):
-            text = page.extract_text()
-            if text and text.strip():
+        for chunk in split_texts:
+            if chunk.strip():
                 text_chunks.append({
-                    "text": text.strip(),
-                    "page": i + 1,
+                    "text": chunk.strip(),
                     "filename": file.filename
+                    # 'page' metadata is removed as chunks now span across multiple pages
                 })
         chunking_ns = time.perf_counter_ns() - t_chunking
 
@@ -99,21 +127,34 @@ async def ingest_document(file: UploadFile = File(...)):
             elapsed = _ns_to_ms(time.perf_counter_ns() - t_start)
             return {
                 "message": "No text extracted from PDF",
-                "timings": {"server_total_ms": elapsed, "bedrock_ms": 0, "lancedb_ms": 0, "file_read_ms": _ns_to_ms(file_read_ns)}
+                "timings": {
+                    "server_total_ms": elapsed,
+                    "bedrock_ms": 0.0,
+                    "file_read_ms": _ns_to_ms(file_read_ns),
+                    "pdf_read_ms": _ns_to_ms(pdf_read_ns),
+                    "chunking_ms": _ns_to_ms(chunking_ns),
+                    "lance_table_open_ms": 0.0,
+                    "lance_insert_rows_ms": 0.0,
+                }
             }
 
-        # Generate embeddings and prepare records
-        bedrock_ns = 0
+        # 3. Generate embeddings concurrently to match LangChain's Node.js behavior
+        t_bed_start = time.perf_counter_ns()
+        
+        def fetch_embedding(text: str):
+            return get_embedding(text)
+            
         data_to_insert = []
-        for chunk in text_chunks:
-            t_bed = time.perf_counter_ns()
-            embedding = get_embedding(chunk["text"])
-            bedrock_ns += time.perf_counter_ns() - t_bed
+        with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+            # Execute all Bedrock API calls in parallel
+            vectors = list(executor.map(fetch_embedding, [c["text"] for c in text_chunks]))
+            
+        bedrock_ns = time.perf_counter_ns() - t_bed_start
 
+        for chunk, vector in zip(text_chunks, vectors):
             data_to_insert.append({
-                "vector": embedding,
+                "vector": vector,
                 "text": chunk["text"],
-                "page": chunk["page"],
                 "filename": chunk["filename"]
             })
 
@@ -122,6 +163,7 @@ async def ingest_document(file: UploadFile = File(...)):
         t_lance_insert_rows = 0
         lance_table_open_ns = 0
         lance_insert_rows_ns = 0
+        
         if TABLE_NAME not in db.table_names():
             t_lance_table_open = time.perf_counter_ns()
             db.create_table(TABLE_NAME, data=data_to_insert)
@@ -173,8 +215,6 @@ async def query_documents(request: QueryRequest):
         lancedb_search_ns = time.perf_counter_ns() - t_lance_search
 
         t_vector_strip = time.perf_counter_ns()
-        # Strip the vector field to keep the response payload small
-        # And compute context length
         retrieved_context_length = 0
         for res in results:
             res.pop("vector", None)
