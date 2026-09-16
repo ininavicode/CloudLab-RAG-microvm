@@ -21,7 +21,8 @@ def compare_environments(test_type, lambda_csv, microvm_csv, output_pdf):
     
     ignore_cols = {
         'id', 'invocation_idx', 'status_code', 'start_epoch_ms', 'wall_time', 
-        'upload_time_ms', 'metric_retrieval_total_numDocs'
+        'upload_time_ms', 'metric_retrieval_total_numDocs',
+        'metric_handler_start_wallTimeMs', 'metric_handler_start_ms'
     }
     
     # Filter only meaningful metrics that exist in BOTH datasets
@@ -29,8 +30,7 @@ def compare_environments(test_type, lambda_csv, microvm_csv, output_pdf):
         c for c in num_cols_l.intersection(num_cols_m) 
         if c not in ignore_cols 
         and not c.startswith('cw_') 
-        and 'epoch' not in c 
-        and 'time' not in c
+        and 'epoch' not in c
     ])
     
     if not common_metrics:

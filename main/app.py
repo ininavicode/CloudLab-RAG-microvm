@@ -82,6 +82,9 @@ async def run_hook():
 
 @app.post("/ingest")
 async def ingest_document(file: UploadFile = File(...)):
+    # Wall-clock timestamp at handler entry — returned so the probe can compute
+    # resume_overhead_ms = server_entry_epoch_ms - probe_send_epoch_ms
+    server_entry_epoch_ms = round(time.time() * 1000, 3)
     t_start = time.perf_counter_ns()
 
     if not file.filename.endswith(".pdf"):
@@ -127,6 +130,7 @@ async def ingest_document(file: UploadFile = File(...)):
             elapsed = _ns_to_ms(time.perf_counter_ns() - t_start)
             return {
                 "message": "No text extracted from PDF",
+                "server_entry_epoch_ms": server_entry_epoch_ms,
                 "timings": {
                     "server_total_ms": elapsed,
                     "bedrock_ms": 0.0,
@@ -180,6 +184,7 @@ async def ingest_document(file: UploadFile = File(...)):
         server_total_ns = time.perf_counter_ns() - t_start
         return {
             "message": f"Successfully ingested {len(text_chunks)} chunks from {file.filename}",
+            "server_entry_epoch_ms": server_entry_epoch_ms,
             "timings": {
                 "server_total_ms": _ns_to_ms(server_total_ns),
                 "bedrock_ms": _ns_to_ms(bedrock_ns),
@@ -196,6 +201,9 @@ async def ingest_document(file: UploadFile = File(...)):
 
 @app.post("/query")
 async def query_documents(request: QueryRequest):
+    # Wall-clock timestamp at handler entry — returned so the probe can compute
+    # resume_overhead_ms = server_entry_epoch_ms - probe_send_epoch_ms
+    server_entry_epoch_ms = round(time.time() * 1000, 3)
     t_start = time.perf_counter_ns()
 
     if TABLE_NAME not in db.table_names():
@@ -224,6 +232,7 @@ async def query_documents(request: QueryRequest):
         server_total_ns = time.perf_counter_ns() - t_start
         return {
             "results": results,
+            "server_entry_epoch_ms": server_entry_epoch_ms,
             "context_length_chars": retrieved_context_length,
             "timings": {
                 "server_total_ms": _ns_to_ms(server_total_ns),

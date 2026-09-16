@@ -8,7 +8,7 @@ def fix_decimals(text):
     return re.sub(r'"(\d+),(\d+)"', r'\1.\2', text)
 
 LAMBDA_INGEST_MAP = {
-    'cw_init_duration_ms': 'resume_overhead_ms',
+    'resume_time_ms': 'resume_overhead_ms',
     'doc_name': 'item_name_or_query',
     'metric_handler_total_dbOpenDuration': 'lance_table_open_ms',
     'metric_handler_total_dbRowsCreationDuration': 'lance_insert_rows_ms',
@@ -19,7 +19,7 @@ LAMBDA_INGEST_MAP = {
 }
 
 LAMBDA_QUERY_MAP = {
-    'cw_init_duration_ms': 'resume_overhead_ms',
+    'resume_time_ms': 'resume_overhead_ms',
     'elapsed_client_ms': 'probe_e2e_ms',
     'metric_bedrock_query_ms_ms': 'bedrock_ms',
     'metric_handler_total_ms': 'server_total_ms',

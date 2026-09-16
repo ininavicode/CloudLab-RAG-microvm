@@ -16,14 +16,14 @@ def main():
         print(f"No CSV files found in {input_dir}")
         return
         
-    # Set up seaborn style
     sns.set_theme(style="whitegrid")
     
     ignore_cols = {
         'id', 'benchmark_type', 'item_name_or_query', 'query', 'doc_name',
         'error', 'response', 'cw_request_id', 'topic', 'status_code',
         'invocation_idx', 'mode', 's3_key', 'metric_handler_total_objectKey',
-        'wall_time', 'upload_time_ms', 'metric_handler_start_wallTimeMs'
+        'wall_time', 'upload_time_ms', 'metric_handler_start_wallTimeMs',
+        'metric_handler_start_ms'
     }
     
     # First pass: find global maximum Y across all files to normalize the Y scale
@@ -58,63 +58,42 @@ def main():
     for file, df in file_dfs.items():
         basename = os.path.basename(file)
         name_no_ext = os.path.splitext(basename)[0]
-        output_pdf = os.path.join(output_dir, f"outliers_boxplot_{name_no_ext}.pdf")
+        output_pdf = os.path.join(output_dir, f"aggregated_boxplot_{name_no_ext}.pdf")
         
         available_metrics = file_metrics[file]
         print(f"Processing {file}...")
         print(f"  Metrics to plot: {available_metrics}")
         
-        # Try to find the item name column to use in title
-        item_col = None
-        for col in ['item_name_or_query', 'query', 'doc_name']:
-            if col in df.columns:
-                item_col = col
-                break
-                
         with PdfPages(output_pdf) as pdf:
-            # Loop through each id
-            for item_id in sorted(df['id'].unique()):
-                df_id = df[df['id'] == item_id]
-                
-                # Transform data from wide to long format so seaborn can plot multiple columns easily
-                df_melted = df_id.melt(
-                    id_vars=['id'],
-                    value_vars=available_metrics,
-                    var_name='metric',
-                    value_name='latency_ms'
-                )
-                
-                # Create the plot
-                plt.figure(figsize=(12, 6))
-                
-                # Boxplot automatically calculates percentiles and outliers
-                sns.boxplot(
-                    data=df_melted, 
-                    x='metric', 
-                    y='latency_ms',
-                    palette="Set2"
-                )
-                
-                # Apply global Y limit
-                if y_upper_limit is not None:
-                    # Allow slight space below 0 for visual clarity of whiskers if any, else 0
-                    plt.ylim(-y_upper_limit * 0.02, y_upper_limit)
-                
-                # Beautify the plot
-                item_name = df_id[item_col].iloc[0] if item_col else "Unknown"
-                # Truncate title if too long
-                if len(str(item_name)) > 80:
-                    item_name = str(item_name)[:77] + "..."
-                    
-                plt.title(f"Latency Distribution by Component\nDataset: {name_no_ext} | ID: {item_id}\n({item_name})", fontsize=12)
-                plt.xlabel("Component / Operation", fontsize=10)
-                plt.ylabel("Latency (ms)", fontsize=10)
-                plt.xticks(rotation=45, ha='right', fontsize=8)
-                plt.tight_layout()
-                
-                # Save the current figure to the PDF
-                pdf.savefig()
-                plt.close()
+            # Transform data from wide to long format for all rows
+            df_melted = df.melt(
+                id_vars=['id'],
+                value_vars=available_metrics,
+                var_name='metric',
+                value_name='latency_ms'
+            )
+            
+            # Create the plot
+            plt.figure(figsize=(14, 8))
+            
+            sns.boxplot(
+                data=df_melted, 
+                x='metric', 
+                y='latency_ms',
+                palette="Set2"
+            )
+            
+            if y_upper_limit is not None:
+                plt.ylim(-y_upper_limit * 0.02, y_upper_limit)
+            
+            plt.title(f"Aggregated Latency Distribution by Component\nDataset: {name_no_ext} (All Tests)", fontsize=16, pad=20)
+            plt.xlabel("Component / Operation", fontsize=12)
+            plt.ylabel("Latency (ms)", fontsize=12)
+            plt.xticks(rotation=45, ha='right', fontsize=10)
+            plt.tight_layout()
+            
+            pdf.savefig()
+            plt.close()
                 
         print(f"  Saved {output_pdf}")
 

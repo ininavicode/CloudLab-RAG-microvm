@@ -118,7 +118,7 @@ def ensure_running(region, microvm_id):
 def do_ingest_request(endpoint, token, pdf_path):
     """
     Performs a multipart file upload to the /ingest endpoint.
-    Returns timings or error info.
+    Returns timings and epoch timestamps for resume overhead computation.
     """
     start_ns = time.perf_counter_ns()
     url = endpoint.rstrip('/') + '/ingest'
@@ -126,23 +126,30 @@ def do_ingest_request(endpoint, token, pdf_path):
         'X-aws-proxy-auth': token,
         'X-aws-proxy-port': '8080'
     }
-    
+
     try:
         with open(pdf_path, 'rb') as f:
             files = {'file': (os.path.basename(pdf_path), f, 'application/pdf')}
+            # Capture wall-clock send time immediately before the request leaves
+            probe_send_epoch_ms = round(time.time() * 1000, 3)
             response = requests.post(url, headers=headers, files=files, timeout=300)
-        
+
         response.raise_for_status()
         end_ns = time.perf_counter_ns()
-        
+
         probe_ms = round((end_ns - start_ns) / 1_000_000, 3)
         json_resp = response.json()
         if 'timings' not in json_resp:
             raise ValueError(f"Missing 'timings' in response: {json_resp}")
         timings = json_resp['timings']
-        
+        server_entry_epoch_ms = json_resp.get('server_entry_epoch_ms', 0.0)
+        resume_overhead_ms = round(server_entry_epoch_ms - probe_send_epoch_ms, 3)
+
         return {
             'probe_e2e_ms': probe_ms,
+            'probe_send_epoch_ms': probe_send_epoch_ms,
+            'server_entry_epoch_ms': server_entry_epoch_ms,
+            'resume_overhead_ms': resume_overhead_ms,
             'server_total_ms': timings.get('server_total_ms', 0.0),
             'bedrock_ms': timings.get('bedrock_ms', 0.0),
             'file_read_ms': timings.get('file_read_ms', 0.0),
@@ -173,6 +180,9 @@ def do_ingest_request(endpoint, token, pdf_path):
 
         return {
             'probe_e2e_ms': probe_ms,
+            'probe_send_epoch_ms': 0.0,
+            'server_entry_epoch_ms': 0.0,
+            'resume_overhead_ms': 0.0,
             'server_total_ms': 0.0,
             'bedrock_ms': 0.0,
             'file_read_ms': 0.0,
@@ -190,7 +200,7 @@ def do_ingest_request(endpoint, token, pdf_path):
 def do_query_request(endpoint, token, question):
     """
     Performs a JSON POST request to the /query endpoint.
-    Returns timings or error info.
+    Returns timings and epoch timestamps for resume overhead computation.
     """
     start_ns = time.perf_counter_ns()
     url = endpoint.rstrip('/') + '/query'
@@ -199,20 +209,27 @@ def do_query_request(endpoint, token, question):
         'X-aws-proxy-port': '8080',
         'Content-Type': 'application/json'
     }
-    
+
     try:
+        # Capture wall-clock send time immediately before the request leaves
+        probe_send_epoch_ms = round(time.time() * 1000, 3)
         response = requests.post(url, headers=headers, json={'question': question}, timeout=300)
         response.raise_for_status()
         end_ns = time.perf_counter_ns()
-        
+
         probe_ms = round((end_ns - start_ns) / 1_000_000, 3)
         json_resp = response.json()
         if 'timings' not in json_resp:
             raise ValueError(f"Missing 'timings' in response: {json_resp}")
         timings = json_resp['timings']
-        
+        server_entry_epoch_ms = json_resp.get('server_entry_epoch_ms', 0.0)
+        resume_overhead_ms = round(server_entry_epoch_ms - probe_send_epoch_ms, 3)
+
         return {
             'probe_e2e_ms': probe_ms,
+            'probe_send_epoch_ms': probe_send_epoch_ms,
+            'server_entry_epoch_ms': server_entry_epoch_ms,
+            'resume_overhead_ms': resume_overhead_ms,
             'server_total_ms': timings.get('server_total_ms', 0.0),
             'bedrock_ms': timings.get('bedrock_ms', 0.0),
             'lancedb_open_ms': timings.get('lancedb_open_ms', 0.0),
@@ -243,6 +260,9 @@ def do_query_request(endpoint, token, question):
 
         return {
             'probe_e2e_ms': probe_ms,
+            'probe_send_epoch_ms': 0.0,
+            'server_entry_epoch_ms': 0.0,
+            'resume_overhead_ms': 0.0,
             'server_total_ms': 0.0,
             'bedrock_ms': 0.0,
             'lancedb_open_ms': 0.0,
@@ -260,20 +280,17 @@ def do_query_request(endpoint, token, question):
 def build_result_row(benchmark_type, item_name, metrics):
     """
     Formats the request metrics into a final dictionary row.
+    resume_overhead_ms is already computed in do_ingest/query_request as
+    server_entry_epoch_ms - probe_send_epoch_ms, so we read it directly here.
     """
-    server_ms = metrics.get('server_total_ms', 0.0)
-    probe_ms = metrics.get('probe_e2e_ms', 0.0)
-    
-    resume_overhead = 0.0
-    if not metrics.get('error'):
-        resume_overhead = round(probe_ms - server_ms, 3)
-        
     return {
         'benchmark_type': benchmark_type,
         'item_name_or_query': item_name,
-        'probe_e2e_ms': probe_ms,
-        'server_total_ms': server_ms,
-        'resume_overhead_ms': resume_overhead,
+        'probe_e2e_ms': metrics.get('probe_e2e_ms', 0.0),
+        'probe_send_epoch_ms': metrics.get('probe_send_epoch_ms', 0.0),
+        'server_entry_epoch_ms': metrics.get('server_entry_epoch_ms', 0.0),
+        'resume_overhead_ms': metrics.get('resume_overhead_ms', 0.0),
+        'server_total_ms': metrics.get('server_total_ms', 0.0),
         'bedrock_ms': metrics.get('bedrock_ms', 0.0),
         # ingest-specific
         'file_read_ms': metrics.get('file_read_ms', 0.0),
@@ -394,7 +411,8 @@ def write_report(results, output_path):
     # Write CSV
     fieldnames = [
         'benchmark_type', 'item_name_or_query', 'probe_e2e_ms',
-        'server_total_ms', 'resume_overhead_ms', 'bedrock_ms',
+        'probe_send_epoch_ms', 'server_entry_epoch_ms', 'resume_overhead_ms',
+        'server_total_ms', 'bedrock_ms',
         # ingest-specific
         'file_read_ms', 'pdf_read_ms', 'chunking_ms',
         'lance_table_open_ms', 'lance_insert_rows_ms',
