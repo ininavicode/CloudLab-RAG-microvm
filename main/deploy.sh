@@ -134,4 +134,17 @@ fi
 echo "MICROVM_URL=$ENDPOINT" > .env
 echo "MICROVM_ID=$MICROVM_ID" >> .env
 
+echo "Fetching auth token for /init-time query..."
+AUTH_TOKEN=$(aws lambda-microvms create-microvm-auth-token \
+    --microvm-identifier "$MICROVM_ID" \
+    --expiration-in-minutes 5 \
+    --allowed-ports '[{"allPorts":{}}]' \
+    --region $REGION \
+    --query "authToken.\"X-aws-proxy-auth\"" \
+    --output text)
+
+echo "Querying MicroVM init time..."
+INIT_TIME_MS=$(curl -s -H "X-aws-proxy-auth: $AUTH_TOKEN" -H "X-aws-proxy-port: 8080" "$ENDPOINT/init-time" | jq -r '.init_time_ms')
+echo "==> MicroVM Cold Start Init Time: ${INIT_TIME_MS}ms"
+
 echo "Deployment complete! Endpoint and ID saved to .env"

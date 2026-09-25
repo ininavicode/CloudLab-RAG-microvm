@@ -1,15 +1,21 @@
 import os
 import json
 import time
+
+# Capture the exact moment the Python runtime starts executing our code
+_APP_INIT_START = time.perf_counter()
+
+import tempfile
 import boto3
 import lancedb
-import io
-import concurrent.futures
+import pyarrow as pa
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from pydantic import BaseModel
-from pypdf import PdfReader
-from langchain_text_splitters import RecursiveCharacterTextSplitter
+
+from langchain_aws import BedrockEmbeddings
+from langchain_text_splitters import CharacterTextSplitter
+from langchain_community.document_loaders import PyPDFLoader
 
 # Configuration
 LANCEDB_PATH = "/tmp/lancedb_data"
@@ -17,44 +23,39 @@ TABLE_NAME = "rag_chunks"
 BEDROCK_MODEL_ID = "amazon.titan-embed-text-v1"
 
 # Globals initialized at startup, not at import time
-bedrock_client = None
+embeddings = None
 db = None
 
-def _ns_to_ms(ns: int) -> float:
-    """Convert nanoseconds to milliseconds with microsecond precision."""
-    return round(ns / 1_000_000, 3)
+# ── Helpers (Iguales que en la Lambda) ─────────────────────────────────────────
+
+def _ms() -> int:
+    """Current epoch time in milliseconds (equivalent to Date.now())."""
+    return int(time.time() * 1000)
+
+def _perf() -> float:
+    """High-resolution monotonic time in milliseconds (equivalent to performance.now())."""
+    return time.perf_counter() * 1000
+
+# ── Ciclo de Vida y Hooks ──────────────────────────────────────────────────────
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Initialize resources after the process is fully running inside the MicroVM."""
-    global bedrock_client, db
+    global embeddings, db
     os.makedirs(LANCEDB_PATH, exist_ok=True)
-    bedrock_client = boto3.client(
-        "bedrock-runtime",
-        region_name=os.environ.get("AWS_REGION", "us-east-1")
+    embeddings = BedrockEmbeddings(
+        region_name=os.environ.get("AWS_REGION", "us-east-1"),
+        model_id=BEDROCK_MODEL_ID
     )
     db = lancedb.connect(LANCEDB_PATH)
+    global _APP_INIT_END
+    _APP_INIT_END = time.perf_counter()
     yield
 
 app = FastAPI(lifespan=lifespan)
 
 class QueryRequest(BaseModel):
     question: str
-
-def get_embedding(text: str) -> list[float]:
-    """Call Bedrock Titan to generate a text embedding. Raises on failure."""
-    body = json.dumps({"inputText": text})
-    response = bedrock_client.invoke_model(
-        body=body,
-        modelId=BEDROCK_MODEL_ID,
-        accept="application/json",
-        contentType="application/json"
-    )
-    response_body = json.loads(response.get("body").read())
-    embedding = response_body.get("embedding")
-    if not embedding:
-        raise ValueError("Bedrock returned an empty embedding")
-    return embedding
 
 @app.post("/aws/lambda-microvms/runtime/v1/ready")
 async def ready_hook():
@@ -64,182 +65,169 @@ async def ready_hook():
 @app.post("/aws/lambda-microvms/runtime/v1/run")
 async def run_hook():
     """Hook called after snapshot restore, before routing external traffic.
-
-    IMPORTANT: boto3 and lancedb hold TCP connection pools that become stale
-    after the MicroVM is suspended (the OS freezes all sockets). If we reuse
-    those connections on resume, boto3 silently retries the same request (same
-    x-amzn-requestid) after hitting a dead socket, causing 15-20s outliers.
-    Reinitialising the clients here gives every resume a fresh connection pool
-    before any user traffic is routed.
+    Re-initializes connections to prevent stale OS sockets post-suspend.
     """
-    global bedrock_client, db
-    bedrock_client = boto3.client(
-        "bedrock-runtime",
-        region_name=os.environ.get("AWS_REGION", "us-east-1")
+    global embeddings, db
+    embeddings = BedrockEmbeddings(
+        region_name=os.environ.get("AWS_REGION", "us-east-1"),
+        model_id=BEDROCK_MODEL_ID
     )
     db = lancedb.connect(LANCEDB_PATH)
     return {"status": "running"}
 
+# ── Endpoints ──────────────────────────────────────────────────────────────────
+
+@app.get("/init-time")
+async def get_init_time():
+    """Returns the one-time cold start initialization time of the application."""
+    if '_APP_INIT_END' not in globals():
+        return {"init_time_ms": 0}
+    return {"init_time_ms": round((_APP_INIT_END - _APP_INIT_START) * 1000)}
+
 @app.post("/ingest")
 async def ingest_document(file: UploadFile = File(...)):
-    # Wall-clock timestamp at handler entry — returned so the probe can compute
-    # resume_overhead_ms = server_entry_epoch_ms - probe_send_epoch_ms
-    server_entry_epoch_ms = round(time.time() * 1000, 3)
-    t_start = time.perf_counter_ns()
+    server_entry_epoch_ms = _ms()
+    handler_start = _perf()
 
     if not file.filename.endswith(".pdf"):
         raise HTTPException(status_code=400, detail="Only PDF files are supported")
 
     try:
-        t_read = time.perf_counter_ns()
+        # 1. Leer archivo HTTP y guardarlo temporalmente para PyPDFLoader
+        t_file_read = _perf()
         content = await file.read()
-        file_read_ns = time.perf_counter_ns() - t_read
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+            tmp.write(content)
+            tmp_path = tmp.name
+        file_read_ms = round(_perf() - t_file_read)
 
-        t_pdf_read = time.perf_counter_ns()
-        pdf = PdfReader(io.BytesIO(content))
-        
-        # 1. Replicating `splitPages: false` by concatenating all pages into a single string
-        full_text = ""
-        for page in pdf.pages:
-            extracted = page.extract_text()
-            if extracted:
-                full_text += extracted + "\n"
-        pdf_read_ns = time.perf_counter_ns() - t_pdf_read
+        # 2. Carga y Chunking (Langchain - Igual que Lambda)
+        t_load_split = _perf()
+        splitter = CharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
+        loader = PyPDFLoader(tmp_path)
+        docs = loader.load_and_split(splitter)
+        texts = [doc.page_content for doc in docs]
+        pdf_read_ms = round(_perf() - t_load_split)   # harness key: pdf_read_ms
 
-        t_chunking = time.perf_counter_ns()
-        # 2. Replicating the Lambda RecursiveCharacterTextSplitter
-        text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=1000,
-            chunk_overlap=200, 
-            length_function=len,
-        )
-        
-        split_texts = text_splitter.split_text(full_text)
-        
-        text_chunks = []
-        for chunk in split_texts:
-            if chunk.strip():
-                text_chunks.append({
-                    "text": chunk.strip(),
-                    "filename": file.filename
-                    # 'page' metadata is removed as chunks now span across multiple pages
-                })
-        chunking_ns = time.perf_counter_ns() - t_chunking
+        # Limpieza del archivo temporal
+        os.remove(tmp_path)
 
-        if not text_chunks:
-            elapsed = _ns_to_ms(time.perf_counter_ns() - t_start)
+        if not texts:
+            server_total_ms = round(_perf() - handler_start)
             return {
                 "message": "No text extracted from PDF",
                 "server_entry_epoch_ms": server_entry_epoch_ms,
                 "timings": {
-                    "server_total_ms": elapsed,
-                    "bedrock_ms": 0.0,
-                    "file_read_ms": _ns_to_ms(file_read_ns),
-                    "pdf_read_ms": _ns_to_ms(pdf_read_ns),
-                    "chunking_ms": _ns_to_ms(chunking_ns),
-                    "lance_table_open_ms": 0.0,
-                    "lance_insert_rows_ms": 0.0,
+                    "server_total_ms": server_total_ms,
+                    "file_read_ms": file_read_ms,
+                    "pdf_read_ms": pdf_read_ms,
+                    "bedrock_ms": 0,
+                    "db_rows_creation_ms": 0,
+                    "lance_table_open_ms": 0,
+                    "lance_insert_rows_ms": 0,
                 }
             }
 
-        # 3. Generate embeddings concurrently to match LangChain's Node.js behavior
-        t_bed_start = time.perf_counter_ns()
-        
-        def fetch_embedding(text: str):
-            return get_embedding(text)
-            
-        data_to_insert = []
-        with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
-            # Execute all Bedrock API calls in parallel
-            vectors = list(executor.map(fetch_embedding, [c["text"] for c in text_chunks]))
-            
-        bedrock_ns = time.perf_counter_ns() - t_bed_start
+        # 3. Bedrock Embeddings (Langchain Secuencial - Igual que Lambda)
+        t_embed = _perf()
+        vectors = embeddings.embed_documents(texts)
+        bedrock_ms = round(_perf() - t_embed)
 
-        for chunk, vector in zip(text_chunks, vectors):
-            data_to_insert.append({
-                "vector": vector,
-                "text": chunk["text"],
-                "filename": chunk["filename"]
-            })
+        # 4. Preparar filas de LanceDB
+        t_rows = _perf()
+        rows = [
+            {"vector": vectors[i], "text": texts[i]}
+            for i in range(len(texts))
+        ]
+        db_rows_ms = round(_perf() - t_rows)
 
-        # Insert into LanceDB (create table on first run, append thereafter)
-        t_lance_table_open = 0
-        t_lance_insert_rows = 0
-        lance_table_open_ns = 0
-        lance_insert_rows_ns = 0
-        
-        if TABLE_NAME not in db.table_names():
-            t_lance_table_open = time.perf_counter_ns()
-            db.create_table(TABLE_NAME, data=data_to_insert)
-            lance_table_open_ns = time.perf_counter_ns() - t_lance_table_open
-        else:
-            t_lance_table_open = time.perf_counter_ns()
+        # 5. Guardado en LanceDB — timer split into open/create + insert
+        t_lance_open = _perf()
+        create_table = False
+        try:
             table = db.open_table(TABLE_NAME)
-            lance_table_open_ns = time.perf_counter_ns() - t_lance_table_open
+        except Exception:
+            create_table = True
+        lance_table_open_ms = round(_perf() - t_lance_open)
 
-            t_lance_insert_rows = time.perf_counter_ns()
-            table.add(data_to_insert)
-            lance_insert_rows_ns = time.perf_counter_ns() - t_lance_insert_rows
+        if create_table:
+            schema = pa.schema([
+                pa.field("vector", pa.list_(pa.float32(), 1536)),
+                pa.field("text", pa.string()),
+            ])
+            table = db.create_table(TABLE_NAME, schema=schema)
 
-        server_total_ns = time.perf_counter_ns() - t_start
+        t_lance_insert = _perf()
+        table.add(rows)
+        lance_insert_rows_ms = round(_perf() - t_lance_insert)
+
+        server_total_ms = round(_perf() - handler_start)
+
         return {
-            "message": f"Successfully ingested {len(text_chunks)} chunks from {file.filename}",
+            "message": f"Successfully ingested {len(texts)} chunks from {file.filename}",
             "server_entry_epoch_ms": server_entry_epoch_ms,
             "timings": {
-                "server_total_ms": _ns_to_ms(server_total_ns),
-                "bedrock_ms": _ns_to_ms(bedrock_ns),
-                "file_read_ms": _ns_to_ms(file_read_ns),
-                "pdf_read_ms": _ns_to_ms(pdf_read_ns),
-                "chunking_ms": _ns_to_ms(chunking_ns),
-                "lance_table_open_ms": _ns_to_ms(lance_table_open_ns),
-                "lance_insert_rows_ms": _ns_to_ms(lance_insert_rows_ns),
+                "server_total_ms": server_total_ms,
+                "file_read_ms": file_read_ms,
+                "pdf_read_ms": pdf_read_ms,
+                "bedrock_ms": bedrock_ms,
+                "db_rows_creation_ms": db_rows_ms,
+                "lance_table_open_ms": lance_table_open_ms,
+                "lance_insert_rows_ms": lance_insert_rows_ms,
             }
         }
     except Exception as e:
         print(f"[ingest] Error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+
 @app.post("/query")
 async def query_documents(request: QueryRequest):
-    # Wall-clock timestamp at handler entry — returned so the probe can compute
-    # resume_overhead_ms = server_entry_epoch_ms - probe_send_epoch_ms
-    server_entry_epoch_ms = round(time.time() * 1000, 3)
-    t_start = time.perf_counter_ns()
+    server_entry_epoch_ms = _ms()
+    handler_start = _perf()
 
     if TABLE_NAME not in db.table_names():
         raise HTTPException(status_code=404, detail="No documents ingested yet")
 
     try:
-        t_bed = time.perf_counter_ns()
-        question_embedding = get_embedding(request.question)
-        bedrock_ns = time.perf_counter_ns() - t_bed
-
-        t_lance_open = time.perf_counter_ns()
+        # Abrir tabla LanceDB
+        t_lance_open = _perf()
         table = db.open_table(TABLE_NAME)
-        lancedb_open_ns = time.perf_counter_ns() - t_lance_open
+        lancedb_open_ms = round(_perf() - t_lance_open)
 
-        t_lance_search = time.perf_counter_ns()
-        results = table.search(question_embedding).limit(5).to_list()
-        lancedb_search_ns = time.perf_counter_ns() - t_lance_search
+        # 1. Inferencia de Bedrock para la pregunta (Igual que Lambda)
+        t_bedrock = _perf()
+        query_vector = embeddings.embed_query(request.question)
+        bedrock_ms = round(_perf() - t_bedrock)
 
-        t_vector_strip = time.perf_counter_ns()
-        retrieved_context_length = 0
-        for res in results:
-            res.pop("vector", None)
-            retrieved_context_length += len(res.get("text", ""))
-        vector_strip_ns = time.perf_counter_ns() - t_vector_strip
+        # 2. Búsqueda Vectorial (Límite 4 y selector - Igual que Lambda)
+        t_lancedb_search = _perf()
+        results = (
+            table.search(query_vector)
+                 .limit(4)
+                 .select(["text"])
+                 .to_list()
+        )
+        lancedb_search_ms = round(_perf() - t_lancedb_search)  # harness key: lancedb_search_ms
 
-        server_total_ns = time.perf_counter_ns() - t_start
+        # 3. Formateo de Contexto
+        t_context = _perf()
+        docs = [r["text"] for r in results]
+        context = "\n\n".join(docs)
+        vector_strip_ms = round(_perf() - t_context)           # harness key: vector_strip_ms
+
+        server_total_ms = round(_perf() - handler_start)
+
         return {
             "results": results,
             "server_entry_epoch_ms": server_entry_epoch_ms,
-            "context_length_chars": retrieved_context_length,
+            "context_length_chars": len(context),
             "timings": {
-                "server_total_ms": _ns_to_ms(server_total_ns),
-                "bedrock_ms": _ns_to_ms(bedrock_ns),
-                "lancedb_open_ms": _ns_to_ms(lancedb_open_ns),
-                "lancedb_search_ms": _ns_to_ms(lancedb_search_ns),
-                "vector_strip_ms": _ns_to_ms(vector_strip_ns),
+                "server_total_ms": server_total_ms,
+                "lancedb_open_ms": lancedb_open_ms,
+                "bedrock_ms": bedrock_ms,
+                "lancedb_search_ms": lancedb_search_ms,
+                "vector_strip_ms": vector_strip_ms,
             }
         }
     except Exception as e:
