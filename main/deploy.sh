@@ -56,7 +56,7 @@ if [ -z "$IMAGE_ARN" ]; then
         --base-image-arn "$BASE_IMAGE_ARN" \
         --build-role-arn "$BUILD_ROLE_ARN" \
         --resources "[{\"minimumMemoryInMiB\": $BASELINE_MEMORY_MIB}]" \
-        --hooks '{"port":8080,"microvmImageHooks":{"ready":"ENABLED","readyTimeoutInSeconds":60}}' \
+        --hooks '{"port":8080,"microvmImageHooks":{"ready":"ENABLED","readyTimeoutInSeconds":60,"resume":"ENABLED","resumeTimeoutInSeconds":60}}' \
         --region $REGION)
     IMAGE_ARN=$(echo "$CREATE_OUTPUT" | jq -r '.imageArn')
 else
@@ -66,6 +66,7 @@ else
         --code-artifact "uri=s3://$CODE_BUCKET/app.zip" \
         --base-image-arn "$BASE_IMAGE_ARN" \
         --build-role-arn "$BUILD_ROLE_ARN" \
+        --hooks '{"port":8080,"microvmImageHooks":{"ready":"ENABLED","readyTimeoutInSeconds":60,"resume":"ENABLED","resumeTimeoutInSeconds":60}}' \
         --region $REGION
 fi
 

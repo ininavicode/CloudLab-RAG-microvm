@@ -419,7 +419,7 @@ def write_report(results, output_path):
         # query-specific
         'lancedb_open_ms', 'lancedb_search_ms', 'vector_strip_ms',
         # shared
-        'context_length_chars', 'error'
+        'bedrock_connection_creation_ms', 'context_length_chars', 'error'
     ]
     
     try:

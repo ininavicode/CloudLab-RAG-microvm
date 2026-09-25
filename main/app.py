@@ -25,6 +25,7 @@ BEDROCK_MODEL_ID = "amazon.titan-embed-text-v1"
 # Globals initialized at startup, not at import time
 embeddings = None
 db = None
+bedrock_connection_creation_ms = 0.0
 
 # ── Helpers (Iguales que en la Lambda) ─────────────────────────────────────────
 
@@ -67,12 +68,29 @@ async def run_hook():
     """Hook called after snapshot restore, before routing external traffic.
     Re-initializes connections to prevent stale OS sockets post-suspend.
     """
-    global embeddings, db
+    global embeddings, db, bedrock_connection_creation_ms
+    t_start = _perf()
     embeddings = BedrockEmbeddings(
         region_name=os.environ.get("AWS_REGION", "us-east-1"),
         model_id=BEDROCK_MODEL_ID
     )
     db = lancedb.connect(LANCEDB_PATH)
+    bedrock_connection_creation_ms = round(_perf() - t_start)
+    return {"status": "running"}
+
+@app.post("/aws/lambda-microvms/runtime/v1/resume")
+async def resume_hook():
+    """Hook called after MicroVM resumes from suspended state.
+    Re-establishes network connections, refresh credentials, validate state. 
+    The MicroVM remains in SUSPENDED state while this hook executes.
+    """
+    global embeddings, bedrock_connection_creation_ms
+    t_start = _perf()
+    embeddings = BedrockEmbeddings(
+        region_name=os.environ.get("AWS_REGION", "us-east-1"),
+        model_id=BEDROCK_MODEL_ID
+    )
+    bedrock_connection_creation_ms = round(_perf() - t_start)
     return {"status": "running"}
 
 # ── Endpoints ──────────────────────────────────────────────────────────────────
@@ -125,6 +143,7 @@ async def ingest_document(file: UploadFile = File(...)):
                     "db_rows_creation_ms": 0,
                     "lance_table_open_ms": 0,
                     "lance_insert_rows_ms": 0,
+                    "bedrock_connection_creation_ms": bedrock_connection_creation_ms,
                 }
             }
 
@@ -163,6 +182,9 @@ async def ingest_document(file: UploadFile = File(...)):
 
         server_total_ms = round(_perf() - handler_start)
 
+        temp_bedrock_connection_creation_ms = bedrock_connection_creation_ms
+        bedrock_connection_creation_ms = 0
+
         return {
             "message": f"Successfully ingested {len(texts)} chunks from {file.filename}",
             "server_entry_epoch_ms": server_entry_epoch_ms,
@@ -174,6 +196,7 @@ async def ingest_document(file: UploadFile = File(...)):
                 "db_rows_creation_ms": db_rows_ms,
                 "lance_table_open_ms": lance_table_open_ms,
                 "lance_insert_rows_ms": lance_insert_rows_ms,
+                "bedrock_connection_creation_ms": temp_bedrock_connection_creation_ms,
             }
         }
     except Exception as e:
@@ -218,6 +241,9 @@ async def query_documents(request: QueryRequest):
 
         server_total_ms = round(_perf() - handler_start)
 
+        temp_bedrock_connection_creation_ms = bedrock_connection_creation_ms
+        bedrock_connection_creation_ms = 0
+
         return {
             "results": results,
             "server_entry_epoch_ms": server_entry_epoch_ms,
@@ -228,6 +254,7 @@ async def query_documents(request: QueryRequest):
                 "bedrock_ms": bedrock_ms,
                 "lancedb_search_ms": lancedb_search_ms,
                 "vector_strip_ms": vector_strip_ms,
+                "bedrock_connection_creation_ms": temp_bedrock_connection_creation_ms,
             }
         }
     except Exception as e:
