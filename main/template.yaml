@@ -28,7 +28,13 @@ Resources:
               - Effect: Allow
                 Action:
                   - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
                 Resource: !Sub "${CodeBucket.Arn}/*"
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                Resource: !GetAtt CodeBucket.Arn
               - Effect: Allow
                 Action:
                   - logs:CreateLogGroup
@@ -68,6 +74,16 @@ Resources:
                   - logs:CreateLogStream
                   - logs:PutLogEvents
                 Resource: "*"
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                Resource: !Sub "${CodeBucket.Arn}/*"
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                Resource: !GetAtt CodeBucket.Arn
 
 Outputs:
   CodeBucketName:

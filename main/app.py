@@ -1,6 +1,9 @@
+import traceback
 import os
 import json
 import time
+import subprocess
+from fastapi import BackgroundTasks
 
 # Capture the exact moment the Python runtime starts executing our code
 _APP_INIT_START = time.perf_counter()
@@ -22,10 +25,22 @@ LANCEDB_PATH = "/tmp/lancedb_data"
 TABLE_NAME = "rag_chunks"
 BEDROCK_MODEL_ID = "amazon.titan-embed-text-v1"
 
+S3_BUCKET = None
+try:
+    with open("config.json") as f:
+        config = json.load(f)
+        S3_BUCKET = config.get("S3_BUCKET")
+except Exception:
+    pass
+
 # Globals initialized at startup, not at import time
 embeddings = None
 db = None
+s3_client = None
 bedrock_connection_creation_ms = 0.0
+s3_client_connection_creation_ms = 0.0
+db_connect_ms = 0.0
+embeddings_read_ms = 0.0
 
 # ── Helpers (Iguales que en la Lambda) ─────────────────────────────────────────
 
@@ -42,13 +57,30 @@ def _perf() -> float:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Initialize resources after the process is fully running inside the MicroVM."""
-    global embeddings, db
+    global embeddings, db, s3_client, s3_client_connection_creation_ms, db_connect_ms, embeddings_read_ms
     os.makedirs(LANCEDB_PATH, exist_ok=True)
+    
+    s3_client_start = time.perf_counter() * 1000
+    s3_client = boto3.client("s3", region_name=os.environ.get("AWS_REGION", "us-east-1"))
+    s3_client_connection_creation_ms = round((time.perf_counter() * 1000) - s3_client_start, 3)
+    
+    if S3_BUCKET:
+        try:
+            t_emb_read = _perf()
+            s3_client.download_file(S3_BUCKET, "lancedb_snapshot.tar.gz", "/tmp/lancedb_snapshot.tar.gz")
+            subprocess.run(["tar", "-xzf", "/tmp/lancedb_snapshot.tar.gz", "-C", "/tmp"], check=True)
+            embeddings_read_ms = round(_perf() - t_emb_read, 3)
+        except Exception:
+            pass
+
     embeddings = BedrockEmbeddings(
         region_name=os.environ.get("AWS_REGION", "us-east-1"),
         model_id=BEDROCK_MODEL_ID
     )
+    
+    t_db = _perf()
     db = lancedb.connect(LANCEDB_PATH)
+    db_connect_ms = round(_perf() - t_db, 3)
     global _APP_INIT_END
     _APP_INIT_END = time.perf_counter()
     yield
@@ -57,6 +89,9 @@ app = FastAPI(lifespan=lifespan)
 
 class QueryRequest(BaseModel):
     question: str
+
+class IngestRequest(BaseModel):
+    s3_key: str
 
 @app.post("/aws/lambda-microvms/runtime/v1/ready")
 async def ready_hook():
@@ -68,14 +103,31 @@ async def run_hook():
     """Hook called after snapshot restore, before routing external traffic.
     Re-initializes connections to prevent stale OS sockets post-suspend.
     """
-    global embeddings, db, bedrock_connection_creation_ms
+    global embeddings, db, bedrock_connection_creation_ms, s3_client, s3_client_connection_creation_ms, db_connect_ms, embeddings_read_ms
+    
+    s3_client_start = time.perf_counter() * 1000
+    s3_client = boto3.client("s3", region_name=os.environ.get("AWS_REGION", "us-east-1"))
+    s3_client_connection_creation_ms = round((time.perf_counter() * 1000) - s3_client_start, 3)
+    
+    if S3_BUCKET:
+        try:
+            t_emb_read = _perf()
+            s3_client.download_file(S3_BUCKET, "lancedb_snapshot.tar.gz", "/tmp/lancedb_snapshot.tar.gz")
+            subprocess.run(["tar", "-xzf", "/tmp/lancedb_snapshot.tar.gz", "-C", "/tmp"], check=True)
+            embeddings_read_ms = round(_perf() - t_emb_read, 3)
+        except Exception:
+            pass
+            
     t_start = _perf()
     embeddings = BedrockEmbeddings(
         region_name=os.environ.get("AWS_REGION", "us-east-1"),
         model_id=BEDROCK_MODEL_ID
     )
+    bedrock_connection_creation_ms = round(_perf() - t_start, 3)
+
+    t_db = _perf()
     db = lancedb.connect(LANCEDB_PATH)
-    bedrock_connection_creation_ms = round(_perf() - t_start)
+    db_connect_ms = round(_perf() - t_db, 3)
     return {"status": "running"}
 
 @app.post("/aws/lambda-microvms/runtime/v1/resume")
@@ -84,16 +136,75 @@ async def resume_hook():
     Re-establishes network connections, refresh credentials, validate state. 
     The MicroVM remains in SUSPENDED state while this hook executes.
     """
-    global embeddings, bedrock_connection_creation_ms
+    global embeddings, db, bedrock_connection_creation_ms, s3_client, s3_client_connection_creation_ms, db_connect_ms
+    
+    s3_client_start = time.perf_counter() * 1000
+    session = boto3.Session()
+    s3_client = session.client("s3", region_name=os.environ.get("AWS_REGION", "us-east-1"))
+    s3_client_connection_creation_ms = round((time.perf_counter() * 1000) - s3_client_start, 3)
+
     t_start = _perf()
     embeddings = BedrockEmbeddings(
         region_name=os.environ.get("AWS_REGION", "us-east-1"),
         model_id=BEDROCK_MODEL_ID
     )
-    bedrock_connection_creation_ms = round(_perf() - t_start)
+    bedrock_connection_creation_ms = round(_perf() - t_start, 3)
+
+    t_db = _perf()
+    db = lancedb.connect(LANCEDB_PATH)
+    db_connect_ms = round(_perf() - t_db, 3)
     return {"status": "running"}
 
+
+def _sync_lancedb_to_s3():
+    if S3_BUCKET and s3_client:
+        try:
+            subprocess.run(["tar", "-czf", "/tmp/lancedb_snapshot.tar.gz", "-C", "/tmp", "lancedb_data"], check=True)
+            s3_client.upload_file("/tmp/lancedb_snapshot.tar.gz", S3_BUCKET, "lancedb_snapshot.tar.gz")
+        except Exception as e:
+            print(f"Failed to sync LanceDB to S3: {e}")
+
+@app.post("/aws/lambda-microvms/runtime/v1/suspend")
+async def suspend_hook():
+    """Hook called before MicroVM suspends."""
+    _sync_lancedb_to_s3()
+    return {"status": "suspended"}
+
+@app.post("/aws/lambda-microvms/runtime/v1/terminate")
+async def terminate_hook():
+    """Hook called before MicroVM terminates."""
+    _sync_lancedb_to_s3()
+    return {"status": "terminated"}
+
+@app.post("/aws/lambda-microvms/runtime/v1/suspend")
+async def suspend_hook():
+    """Hook called before MicroVM suspends.
+    Flush pending writes, close connections, release resources.
+    """
+    if S3_BUCKET and s3_client:
+        try:
+            subprocess.run(["tar", "-czf", "/tmp/lancedb_snapshot.tar.gz", "-C", "/tmp", "lancedb_data"], check=True)
+            s3_client.upload_file("/tmp/lancedb_snapshot.tar.gz", S3_BUCKET, "lancedb_snapshot.tar.gz")
+        except Exception as e:
+            print(f"Failed to sync LanceDB to S3 on suspend: {e}")
+    return {"status": "suspended"}
+
+@app.post("/aws/lambda-microvms/runtime/v1/terminate")
+async def terminate_hook():
+    """Hook called before MicroVM terminates.
+    Flush data, notify external systems, clean up.
+    """
+    if S3_BUCKET and s3_client:
+        try:
+            subprocess.run(["tar", "-czf", "/tmp/lancedb_snapshot.tar.gz", "-C", "/tmp", "lancedb_data"], check=True)
+            s3_client.upload_file("/tmp/lancedb_snapshot.tar.gz", S3_BUCKET, "lancedb_snapshot.tar.gz")
+        except Exception as e:
+            print(f"Failed to sync LanceDB to S3 on terminate: {e}")
+    return {"status": "terminated"}
+
 # ── Endpoints ──────────────────────────────────────────────────────────────────
+
+
 
 @app.get("/init-time")
 async def get_init_time():
@@ -103,21 +214,24 @@ async def get_init_time():
     return {"init_time_ms": round((_APP_INIT_END - _APP_INIT_START) * 1000)}
 
 @app.post("/ingest")
-async def ingest_document(file: UploadFile = File(...)):
+async def ingest_document(request: IngestRequest):
+    global bedrock_connection_creation_ms, s3_client_connection_creation_ms, db_connect_ms, embeddings_read_ms
     server_entry_epoch_ms = _ms()
     handler_start = _perf()
 
-    if not file.filename.endswith(".pdf"):
+    if not request.s3_key.endswith(".pdf"):
         raise HTTPException(status_code=400, detail="Only PDF files are supported")
 
     try:
-        # 1. Leer archivo HTTP y guardarlo temporalmente para PyPDFLoader
+        # 1. Download file from S3
         t_file_read = _perf()
-        content = await file.read()
         with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
-            tmp.write(content)
             tmp_path = tmp.name
+            
+        s3_client.download_file(S3_BUCKET, request.s3_key, tmp_path)
         file_read_ms = round(_perf() - t_file_read)
+
+        print("DOWNLOADED FILE")
 
         # 2. Carga y Chunking (Langchain - Igual que Lambda)
         t_load_split = _perf()
@@ -143,7 +257,10 @@ async def ingest_document(file: UploadFile = File(...)):
                     "db_rows_creation_ms": 0,
                     "lance_table_open_ms": 0,
                     "lance_insert_rows_ms": 0,
+                    "s3_client_connection_creation_ms": s3_client_connection_creation_ms,
                     "bedrock_connection_creation_ms": bedrock_connection_creation_ms,
+                    "db_connect_ms": db_connect_ms,
+                    "embeddings_read_ms": embeddings_read_ms,
                 }
             }
 
@@ -183,10 +300,16 @@ async def ingest_document(file: UploadFile = File(...)):
         server_total_ms = round(_perf() - handler_start)
 
         temp_bedrock_connection_creation_ms = bedrock_connection_creation_ms
+        temp_s3_client_connection_creation_ms = s3_client_connection_creation_ms
+        temp_db_connect_ms = db_connect_ms
+        temp_embeddings_read_ms = embeddings_read_ms
         bedrock_connection_creation_ms = 0
-
+        s3_client_connection_creation_ms = 0
+        db_connect_ms = 0
+        embeddings_read_ms = 0
+        
         return {
-            "message": f"Successfully ingested {len(texts)} chunks from {file.filename}",
+            "message": f"Successfully ingested {len(texts)} chunks from {request.s3_key}",
             "server_entry_epoch_ms": server_entry_epoch_ms,
             "timings": {
                 "server_total_ms": server_total_ms,
@@ -196,16 +319,21 @@ async def ingest_document(file: UploadFile = File(...)):
                 "db_rows_creation_ms": db_rows_ms,
                 "lance_table_open_ms": lance_table_open_ms,
                 "lance_insert_rows_ms": lance_insert_rows_ms,
+                "s3_client_connection_creation_ms": temp_s3_client_connection_creation_ms,
                 "bedrock_connection_creation_ms": temp_bedrock_connection_creation_ms,
+                "db_connect_ms": temp_db_connect_ms,
+                "embeddings_read_ms": temp_embeddings_read_ms,
             }
         }
     except Exception as e:
-        print(f"[ingest] Error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        tb_str = traceback.format_exc()
+        print(f"[ingest] Error:\n{tb_str}")
+        raise HTTPException(status_code=500, detail=f"{e}\n\nTraceback:\n{tb_str}")
 
 
 @app.post("/query")
 async def query_documents(request: QueryRequest):
+    global bedrock_connection_creation_ms, s3_client_connection_creation_ms, db_connect_ms, embeddings_read_ms
     server_entry_epoch_ms = _ms()
     handler_start = _perf()
 
@@ -241,8 +369,15 @@ async def query_documents(request: QueryRequest):
 
         server_total_ms = round(_perf() - handler_start)
 
+        global bedrock_connection_creation_ms, s3_client_connection_creation_ms, db_connect_ms, embeddings_read_ms
         temp_bedrock_connection_creation_ms = bedrock_connection_creation_ms
+        temp_s3_client_connection_creation_ms = s3_client_connection_creation_ms
+        temp_db_connect_ms = db_connect_ms
+        temp_embeddings_read_ms = embeddings_read_ms
         bedrock_connection_creation_ms = 0
+        s3_client_connection_creation_ms = 0
+        db_connect_ms = 0
+        embeddings_read_ms = 0
 
         return {
             "results": results,
@@ -254,9 +389,13 @@ async def query_documents(request: QueryRequest):
                 "bedrock_ms": bedrock_ms,
                 "lancedb_search_ms": lancedb_search_ms,
                 "vector_strip_ms": vector_strip_ms,
+                "s3_client_connection_creation_ms": temp_s3_client_connection_creation_ms,
                 "bedrock_connection_creation_ms": temp_bedrock_connection_creation_ms,
+                "db_connect_ms": temp_db_connect_ms,
+                "embeddings_read_ms": temp_embeddings_read_ms,
             }
         }
     except Exception as e:
-        print(f"[query] Error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        tb_str = traceback.format_exc()
+        print(f"[query] Error:\n{tb_str}")
+        raise HTTPException(status_code=500, detail=f"{e}\n\nTraceback:\n{tb_str}")

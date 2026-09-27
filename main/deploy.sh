@@ -4,7 +4,7 @@ set -e
 STACK_NAME="jmejias-rag-microvm-stack"
 REGION="us-east-1"
 IMAGE_NAME="jmejias-microvm-rag-image"
-BASELINE_MEMORY_MIB="${BASELINE_MEMORY_MIB:-1024}"
+BASELINE_MEMORY_MIB="1024"
 
 echo "Fetching managed base image ARN..."
 BASE_IMAGE_ARN=$(aws lambda-microvms list-managed-microvm-images \
@@ -34,8 +34,10 @@ EXECUTION_ROLE_ARN=$(aws cloudformation describe-stacks \
     --output text)
 
 echo "Packaging application..."
+# Write config.json for the MicroVM to know which bucket to use
+echo "{\"S3_BUCKET\": \"$CODE_BUCKET\"}" > config.json
 # -j stores files flat (no directory prefix) so Dockerfile is at the top level of the zip
-zip -j app.zip Dockerfile app.py requirements.txt
+zip -j app.zip Dockerfile app.py requirements.txt config.json
 
 echo "Uploading artifact to S3 ($CODE_BUCKET)..."
 aws s3 cp app.zip s3://$CODE_BUCKET/app.zip
@@ -56,7 +58,7 @@ if [ -z "$IMAGE_ARN" ]; then
         --base-image-arn "$BASE_IMAGE_ARN" \
         --build-role-arn "$BUILD_ROLE_ARN" \
         --resources "[{\"minimumMemoryInMiB\": $BASELINE_MEMORY_MIB}]" \
-        --hooks '{"port":8080,"microvmImageHooks":{"ready":"ENABLED","readyTimeoutInSeconds":60,"resume":"ENABLED","resumeTimeoutInSeconds":60}}' \
+        --hooks '{"port":8080,"microvmImageHooks":{"ready":"ENABLED","readyTimeoutInSeconds":60},"microvmHooks":{"run":"ENABLED","runTimeoutInSeconds":60,"resume":"ENABLED","resumeTimeoutInSeconds":60,"suspend":"ENABLED","suspendTimeoutInSeconds":60,"terminate":"ENABLED","terminateTimeoutInSeconds":60}}' \
         --region $REGION)
     IMAGE_ARN=$(echo "$CREATE_OUTPUT" | jq -r '.imageArn')
 else
@@ -66,7 +68,7 @@ else
         --code-artifact "uri=s3://$CODE_BUCKET/app.zip" \
         --base-image-arn "$BASE_IMAGE_ARN" \
         --build-role-arn "$BUILD_ROLE_ARN" \
-        --hooks '{"port":8080,"microvmImageHooks":{"ready":"ENABLED","readyTimeoutInSeconds":60,"resume":"ENABLED","resumeTimeoutInSeconds":60}}' \
+        --hooks '{"port":8080,"microvmImageHooks":{"ready":"ENABLED","readyTimeoutInSeconds":60},"microvmHooks":{"run":"ENABLED","runTimeoutInSeconds":60,"resume":"ENABLED","resumeTimeoutInSeconds":60,"suspend":"ENABLED","suspendTimeoutInSeconds":60,"terminate":"ENABLED","terminateTimeoutInSeconds":60}}' \
         --region $REGION
 fi
 
@@ -134,6 +136,7 @@ if [[ "$ENDPOINT" != http* ]]; then
 fi
 echo "MICROVM_URL=$ENDPOINT" > .env
 echo "MICROVM_ID=$MICROVM_ID" >> .env
+echo "S3_BUCKET=$CODE_BUCKET" >> .env
 
 echo "Fetching auth token for /init-time query..."
 AUTH_TOKEN=$(aws lambda-microvms create-microvm-auth-token \

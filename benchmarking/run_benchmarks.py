@@ -45,6 +45,9 @@ def load_env_defaults(args):
                 elif line.startswith('MICROVM_ID='):
                     if not args.microvm_id:
                         args.microvm_id = line.split('=', 1)[1]
+                elif line.startswith('S3_BUCKET='):
+                    if not getattr(args, 's3_bucket', None):
+                        args.s3_bucket = line.split('=', 1)[1]
     except Exception as e:
         print_progress(f"Error reading .env file: {e}")
 
@@ -115,24 +118,23 @@ def ensure_running(region, microvm_id):
     else:
         raise ValueError(f"Unexpected MicroVM state: {state}")
 
-def do_ingest_request(endpoint, token, pdf_path):
+def do_ingest_request(endpoint, token, s3_key):
     """
-    Performs a multipart file upload to the /ingest endpoint.
+    Performs a JSON POST request to the /ingest endpoint with the s3_key.
     Returns timings and epoch timestamps for resume overhead computation.
     """
     start_ns = time.perf_counter_ns()
     url = endpoint.rstrip('/') + '/ingest'
     headers = {
         'X-aws-proxy-auth': token,
-        'X-aws-proxy-port': '8080'
+        'X-aws-proxy-port': '8080',
+        'Content-Type': 'application/json'
     }
 
     try:
-        with open(pdf_path, 'rb') as f:
-            files = {'file': (os.path.basename(pdf_path), f, 'application/pdf')}
-            # Capture wall-clock send time immediately before the request leaves
-            probe_send_epoch_ms = round(time.time() * 1000, 3)
-            response = requests.post(url, headers=headers, files=files, timeout=300)
+        # Capture wall-clock send time immediately before the request leaves
+        probe_send_epoch_ms = round(time.time() * 1000, 3)
+        response = requests.post(url, headers=headers, json={"s3_key": s3_key}, timeout=300)
 
         response.raise_for_status()
         end_ns = time.perf_counter_ns()
@@ -151,6 +153,10 @@ def do_ingest_request(endpoint, token, pdf_path):
             'server_entry_epoch_ms': server_entry_epoch_ms,
             'resume_overhead_ms': resume_overhead_ms,
             'server_total_ms': timings.get('server_total_ms', 0.0),
+            's3_client_connection_creation_ms': timings.get('s3_client_connection_creation_ms', 0.0),
+            'bedrock_connection_creation_ms': timings.get('bedrock_connection_creation_ms', 0.0),
+            'db_connect_ms': timings.get('db_connect_ms', 0.0),
+            'embeddings_read_ms': timings.get('embeddings_read_ms', 0.0),
             'bedrock_ms': timings.get('bedrock_ms', 0.0),
             'file_read_ms': timings.get('file_read_ms', 0.0),
             'pdf_read_ms': timings.get('pdf_read_ms', 0.0),
@@ -176,7 +182,7 @@ def do_ingest_request(endpoint, token, pdf_path):
                     if detail:
                         err_msg = f"{e.response.status_code} Error: {detail}"
             except Exception:
-                err_msg = f"{e.response.status_code} Error: {e.response.text[:200]}"
+                err_msg = f"{e.response.status_code} Error: {e.response.text}"
 
         return {
             'probe_e2e_ms': probe_ms,
@@ -184,6 +190,10 @@ def do_ingest_request(endpoint, token, pdf_path):
             'server_entry_epoch_ms': 0.0,
             'resume_overhead_ms': 0.0,
             'server_total_ms': 0.0,
+            's3_client_connection_creation_ms': 0.0,
+            'bedrock_connection_creation_ms': 0.0,
+            'db_connect_ms': 0.0,
+            'embeddings_read_ms': 0.0,
             'bedrock_ms': 0.0,
             'file_read_ms': 0.0,
             'pdf_read_ms': 0.0,
@@ -231,6 +241,10 @@ def do_query_request(endpoint, token, question):
             'server_entry_epoch_ms': server_entry_epoch_ms,
             'resume_overhead_ms': resume_overhead_ms,
             'server_total_ms': timings.get('server_total_ms', 0.0),
+            's3_client_connection_creation_ms': timings.get('s3_client_connection_creation_ms', 0.0),
+            'bedrock_connection_creation_ms': timings.get('bedrock_connection_creation_ms', 0.0),
+            'db_connect_ms': timings.get('db_connect_ms', 0.0),
+            'embeddings_read_ms': timings.get('embeddings_read_ms', 0.0),
             'bedrock_ms': timings.get('bedrock_ms', 0.0),
             'lancedb_open_ms': timings.get('lancedb_open_ms', 0.0),
             'lancedb_search_ms': timings.get('lancedb_search_ms', 0.0),
@@ -256,7 +270,7 @@ def do_query_request(endpoint, token, question):
                     if detail:
                         err_msg = f"{e.response.status_code} Error: {detail}"
             except Exception:
-                err_msg = f"{e.response.status_code} Error: {e.response.text[:200]}"
+                err_msg = f"{e.response.status_code} Error: {e.response.text}"
 
         return {
             'probe_e2e_ms': probe_ms,
@@ -264,6 +278,10 @@ def do_query_request(endpoint, token, question):
             'server_entry_epoch_ms': 0.0,
             'resume_overhead_ms': 0.0,
             'server_total_ms': 0.0,
+            's3_client_connection_creation_ms': 0.0,
+            'bedrock_connection_creation_ms': 0.0,
+            'db_connect_ms': 0.0,
+            'embeddings_read_ms': 0.0,
             'bedrock_ms': 0.0,
             'lancedb_open_ms': 0.0,
             'lancedb_search_ms': 0.0,
@@ -291,6 +309,10 @@ def build_result_row(benchmark_type, item_name, metrics):
         'server_entry_epoch_ms': metrics.get('server_entry_epoch_ms', 0.0),
         'resume_overhead_ms': metrics.get('resume_overhead_ms', 0.0),
         'server_total_ms': metrics.get('server_total_ms', 0.0),
+        's3_client_connection_creation_ms': metrics.get('s3_client_connection_creation_ms', 0.0),
+        'bedrock_connection_creation_ms': metrics.get('bedrock_connection_creation_ms', 0.0),
+        'db_connect_ms': metrics.get('db_connect_ms', 0.0),
+        'embeddings_read_ms': metrics.get('embeddings_read_ms', 0.0),
         'bedrock_ms': metrics.get('bedrock_ms', 0.0),
         # ingest-specific
         'file_read_ms': metrics.get('file_read_ms', 0.0),
@@ -316,11 +338,15 @@ def run_ingest_suspended(args, region, endpoint, microvm_id):
         print_progress(f"No PDF files found in directory: {args.dir}")
         return results
 
+    import boto3
+    s3 = boto3.client('s3', region_name=region)
     for i, pdf_path in enumerate(pdf_files):
         print_progress(f"Processing [{i+1}/{len(pdf_files)}]: {os.path.basename(pdf_path)}")
+        s3_key = f"pdfs/{os.path.basename(pdf_path)}"
+        s3.upload_file(pdf_path, args.s3_bucket, s3_key)
         suspend_and_wait(region, microvm_id)
         token = get_auth_token(region, microvm_id)
-        metrics = do_ingest_request(endpoint, token, pdf_path)
+        metrics = do_ingest_request(endpoint, token, s3_key)
         row = build_result_row('ingest-suspended', os.path.basename(pdf_path), metrics)
         if row['error']:
             print_progress(f"  Error: {row['error']}")
@@ -341,9 +367,13 @@ def run_ingest_warm(args, region, endpoint, microvm_id):
     ensure_running(region, microvm_id)
     token = get_auth_token(region, microvm_id)
     
+    import boto3
+    s3 = boto3.client('s3', region_name=region)
     for i, pdf_path in enumerate(pdf_files):
         print_progress(f"Processing [{i+1}/{len(pdf_files)}]: {os.path.basename(pdf_path)}")
-        metrics = do_ingest_request(endpoint, token, pdf_path)
+        s3_key = f"pdfs/{os.path.basename(pdf_path)}"
+        s3.upload_file(pdf_path, args.s3_bucket, s3_key)
+        metrics = do_ingest_request(endpoint, token, s3_key)
         row = build_result_row('ingest-warm', os.path.basename(pdf_path), metrics)
         if row['error']:
             print_progress(f"  Error: {row['error']}")
@@ -419,7 +449,7 @@ def write_report(results, output_path):
         # query-specific
         'lancedb_open_ms', 'lancedb_search_ms', 'vector_strip_ms',
         # shared
-        'bedrock_connection_creation_ms', 'context_length_chars', 'error'
+        's3_client_connection_creation_ms', 'bedrock_connection_creation_ms', 'db_connect_ms', 'embeddings_read_ms', 'context_length_chars', 'error'
     ]
     
     try:
@@ -449,6 +479,7 @@ def main():
     ], help="Benchmark mode to run.")
     parser.add_argument('--dir', help="Path to directory of PDF files (required for ingest modes).")
     parser.add_argument('--questions', help="Path to JSON file with array of queries (required for query modes).")
+    parser.add_argument('--s3-bucket', help='Target S3 bucket for data.')
     parser.add_argument('--microvm-id', help="Target MicroVM ID (defaults to reading ../main/.env).")
     parser.add_argument('--endpoint', help="Target MicroVM URL (defaults to reading ../main/.env).")
     parser.add_argument('--region', default='us-east-1', help="AWS Region (default: us-east-1).")
