@@ -3,7 +3,8 @@ import os
 import json
 import time
 import subprocess
-from fastapi import BackgroundTasks
+import threading
+import psutil
 
 # Capture the exact moment the Python runtime starts executing our code
 _APP_INIT_START = time.perf_counter()
@@ -51,6 +52,83 @@ def _ms() -> int:
 def _perf() -> float:
     """High-resolution monotonic time in milliseconds (equivalent to performance.now())."""
     return time.perf_counter() * 1000
+
+
+class ResourceSampler:
+    """Samples CPU, RAM and disk I/O in a background thread at a fixed interval.
+
+    Usage::
+
+        sampler = ResourceSampler(interval_ms=25)
+        sampler.start()
+        # ... do work ...
+        samples = sampler.stop()  # list of dicts, one per sample tick
+
+    Each sample dict contains:
+        cpu_percent   – CPU utilisation since previous sample (all cores, 0-100*n_cpus)
+        ram_rss_mb    – resident set size of this process in MiB
+        disk_read_kb  – kilobytes read from disk since previous sample
+        disk_write_kb – kilobytes written to disk since previous sample
+        sample_interval_ms – actual elapsed wall-clock time since previous sample (ms)
+    """
+
+    def __init__(self, interval_ms: float = 25):
+        self._interval_s = interval_ms / 1000.0
+        self._stop_event = threading.Event()
+        self._samples: list = []
+        self._thread: threading.Thread | None = None
+        self._proc = psutil.Process()
+        # Prime the non-blocking cpu_percent so first real reading is meaningful
+        self._proc.cpu_percent(interval=None)
+        # Baseline disk counters (may be None on some platforms)
+        self._last_disk = psutil.disk_io_counters()
+        self._last_ts = time.perf_counter()
+
+    def _run(self):
+        while not self._stop_event.wait(timeout=self._interval_s):
+            now = time.perf_counter()
+            elapsed_ms = round((now - self._last_ts) * 1000, 3)
+            self._last_ts = now
+
+            cpu = self._proc.cpu_percent(interval=None)
+            rss_mb = round(self._proc.memory_info().rss / (1024 * 1024), 3)
+
+            disk_read_kb = 0.0
+            disk_write_kb = 0.0
+            try:
+                cur_disk = psutil.disk_io_counters()
+                if cur_disk is not None and self._last_disk is not None:
+                    disk_read_kb = round((cur_disk.read_bytes - self._last_disk.read_bytes) / 1024, 3)
+                    disk_write_kb = round((cur_disk.write_bytes - self._last_disk.write_bytes) / 1024, 3)
+                self._last_disk = cur_disk
+            except Exception:
+                pass
+
+            self._samples.append({
+                "sample_interval_ms": elapsed_ms,
+                "cpu_percent": cpu,
+                "ram_rss_mb": rss_mb,
+                "disk_read_kb": disk_read_kb,
+                "disk_write_kb": disk_write_kb,
+            })
+
+    def start(self):
+        """Start the background sampling thread."""
+        self._stop_event.clear()
+        self._samples = []
+        self._last_ts = time.perf_counter()
+        # Re-prime CPU counter right before we start so first delta is clean
+        self._proc.cpu_percent(interval=None)
+        self._last_disk = psutil.disk_io_counters()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def stop(self) -> list:
+        """Stop sampling and return the collected samples."""
+        self._stop_event.set()
+        if self._thread:
+            self._thread.join(timeout=1.0)
+        return list(self._samples)
 
 # ── Ciclo de Vida y Hooks ──────────────────────────────────────────────────────
 
@@ -222,6 +300,9 @@ async def ingest_document(request: IngestRequest):
     if not request.s3_key.endswith(".pdf"):
         raise HTTPException(status_code=400, detail="Only PDF files are supported")
 
+    sampler = ResourceSampler(interval_ms=25)
+    sampler.start()
+
     try:
         # 1. Download file from S3
         t_file_read = _perf()
@@ -245,6 +326,7 @@ async def ingest_document(request: IngestRequest):
         os.remove(tmp_path)
 
         if not texts:
+            resource_samples = sampler.stop()
             server_total_ms = round(_perf() - handler_start)
             return {
                 "message": "No text extracted from PDF",
@@ -261,7 +343,8 @@ async def ingest_document(request: IngestRequest):
                     "bedrock_connection_creation_ms": bedrock_connection_creation_ms,
                     "db_connect_ms": db_connect_ms,
                     "embeddings_read_ms": embeddings_read_ms,
-                }
+                },
+                "resource_samples": resource_samples,
             }
 
         # 3. Bedrock Embeddings (Langchain Secuencial - Igual que Lambda)
@@ -297,6 +380,7 @@ async def ingest_document(request: IngestRequest):
         table.add(rows)
         lance_insert_rows_ms = round(_perf() - t_lance_insert)
 
+        resource_samples = sampler.stop()
         server_total_ms = round(_perf() - handler_start)
 
         temp_bedrock_connection_creation_ms = bedrock_connection_creation_ms
@@ -323,9 +407,11 @@ async def ingest_document(request: IngestRequest):
                 "bedrock_connection_creation_ms": temp_bedrock_connection_creation_ms,
                 "db_connect_ms": temp_db_connect_ms,
                 "embeddings_read_ms": temp_embeddings_read_ms,
-            }
+            },
+            "resource_samples": resource_samples,
         }
     except Exception as e:
+        sampler.stop()  # ensure thread is cleaned up on error
         tb_str = traceback.format_exc()
         print(f"[ingest] Error:\n{tb_str}")
         raise HTTPException(status_code=500, detail=f"{e}\n\nTraceback:\n{tb_str}")
@@ -339,6 +425,9 @@ async def query_documents(request: QueryRequest):
 
     if TABLE_NAME not in db.table_names():
         raise HTTPException(status_code=404, detail="No documents ingested yet")
+
+    sampler = ResourceSampler(interval_ms=25)
+    sampler.start()
 
     try:
         # Abrir tabla LanceDB
@@ -369,6 +458,8 @@ async def query_documents(request: QueryRequest):
 
         server_total_ms = round(_perf() - handler_start)
 
+        resource_samples = sampler.stop()
+
         global bedrock_connection_creation_ms, s3_client_connection_creation_ms, db_connect_ms, embeddings_read_ms
         temp_bedrock_connection_creation_ms = bedrock_connection_creation_ms
         temp_s3_client_connection_creation_ms = s3_client_connection_creation_ms
@@ -393,9 +484,11 @@ async def query_documents(request: QueryRequest):
                 "bedrock_connection_creation_ms": temp_bedrock_connection_creation_ms,
                 "db_connect_ms": temp_db_connect_ms,
                 "embeddings_read_ms": temp_embeddings_read_ms,
-            }
+            },
+            "resource_samples": resource_samples,
         }
     except Exception as e:
+        sampler.stop()  # ensure thread is cleaned up on error
         tb_str = traceback.format_exc()
         print(f"[query] Error:\n{tb_str}")
         raise HTTPException(status_code=500, detail=f"{e}\n\nTraceback:\n{tb_str}")

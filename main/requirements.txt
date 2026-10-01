@@ -10,3 +10,4 @@ langchain-core>=0.2.0
 boto3>=1.34.0
 lancedb>=0.8.0
 pyarrow>=14.0.0
+psutil>=5.9.0
