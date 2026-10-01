@@ -4,7 +4,7 @@ set -e
 STACK_NAME="jmejias-rag-microvm-stack"
 REGION="us-east-1"
 IMAGE_NAME="jmejias-microvm-rag-image"
-BASELINE_MEMORY_MIB="1024"
+BASELINE_MEMORY_MIB="512"
 
 echo "Fetching managed base image ARN..."
 BASE_IMAGE_ARN=$(aws lambda-microvms list-managed-microvm-images \

@@ -18,6 +18,13 @@ if [ -z "$MICROVM_URL" ] || [ -z "$MICROVM_ID" ]; then
     exit 1
 fi
 
+# Read S3_BUCKET from config.json
+S3_BUCKET=$(jq -r '.S3_BUCKET' config.json)
+if [ -z "$S3_BUCKET" ] || [ "$S3_BUCKET" = "null" ]; then
+    echo "Error: Could not read S3_BUCKET from config.json"
+    exit 1
+fi
+
 echo "Generating auth token..."
 TOKEN_JSON=$(aws lambda-microvms create-microvm-auth-token \
     --microvm-identifier "$MICROVM_ID" \
@@ -28,11 +35,18 @@ TOKEN=$(echo "$TOKEN_JSON" | jq -r '.authToken["X-aws-proxy-auth"]')
 
 for pdf_file in "$DIR"/*.pdf; do
     if [ -f "$pdf_file" ]; then
-        echo "Ingesting $pdf_file..."
+        BASENAME=$(basename "$pdf_file")
+        S3_KEY="pdfs/$BASENAME"
+
+        echo "Uploading $BASENAME to s3://$S3_BUCKET/$S3_KEY ..."
+        aws s3 cp "$pdf_file" "s3://$S3_BUCKET/$S3_KEY"
+
+        echo "Ingesting $BASENAME via MicroVM..."
         curl -s -X POST "$MICROVM_URL/ingest" \
             -H "X-aws-proxy-auth: $TOKEN" \
             -H "X-aws-proxy-port: 8080" \
-            -F "file=@$pdf_file"
+            -H "Content-Type: application/json" \
+            -d "{\"s3_key\": \"$S3_KEY\"}"
         echo -e "\n"
     fi
 done
